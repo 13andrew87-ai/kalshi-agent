@@ -971,8 +971,8 @@ def render_credentials(self: "WebDashboard") -> str:
 <h1 style="font-size:22px;margin:0 0 4px;">&#128273; API Credentials</h1>
 <div style="color:#64748b;font-size:12px;margin-bottom:14px;">
 Used to sign Kalshi Trade API requests (RSA-PSS). Sim &amp; paper modes on the
-<a href="{base}/" style="color:#93c5fd;">dashboard</a> work without any credentials.
-<a href="{base}/" style="color:#93c5fd;">&larr; back to dashboard</a> &middot; <form method="post" action="/logout" style="display:inline"><button style="background:none;border:none;color:#64748b;font-size:12px;cursor:pointer;text-decoration:underline;font-family:inherit;padding:0;">sign out</button></form></div>
+<a href="{base}/dashboard" style="color:#93c5fd;">dashboard</a> work without any credentials.
+<a href="{base}/dashboard" style="color:#93c5fd;">&larr; back to dashboard</a> &middot; <form method="post" action="/logout" style="display:inline"><button style="background:none;border:none;color:#64748b;font-size:12px;cursor:pointer;text-decoration:underline;font-family:inherit;padding:0;">sign out</button></form></div>
 
 <div style="background:#1e293b;border:1px solid #f59e0b;border-radius:10px;padding:12px 14px;margin-bottom:16px;font-size:13px;color:#fcd34d;">
 <b>Handle with care:</b> this dashboard is password-protected. Prefer
@@ -1148,7 +1148,7 @@ def render_bet_confirm(dash: "WebDashboard", bet: dict, token: str, error: str =
     confirm_style = _btn_style('#b91c1c' if env == "live" else '#166534', disabled=not caps_ok)
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>Confirm bet — Kalshi Agent</title></head>
 <body style="margin:0;background:#0b1220;"><div style="{_BET_STYLE}">
-<a href="{base}/" style="color:#64748b;font-size:12px;text-decoration:none;">&larr; back to dashboard</a>
+<a href="{base}/dashboard" style="color:#64748b;font-size:12px;text-decoration:none;">&larr; back to dashboard</a>
 <h1 style="font-size:20px;margin:14px 0 2px;">Confirm your bet <span style="font-size:11px;color:{accent};border:1px solid {accent};border-radius:999px;padding:2px 10px;vertical-align:middle;">{label}</span></h1>
 <div style="color:#64748b;font-size:12px;margin-bottom:14px;">This is the only step that can send anything. Review everything, then confirm.</div>
 {err_html}
@@ -1184,7 +1184,7 @@ def render_bet_result(outcome: dict) -> str:
         bet = outcome.get("bet") or {}
         if bet.get("checks"):
             inner += _panel('RISK CHECKS AT SEND TIME', _bet_checks_rows(bet["checks"]))
-        inner += f'<div style="margin-top:16px;"><a href="{base}/" style="color:#93c5fd;">&larr; back to dashboard</a></div>'
+        inner += f'<div style="margin-top:16px;"><a href="{base}/dashboard" style="color:#93c5fd;">&larr; back to dashboard</a></div>'
         return f'<!doctype html><html><head><meta charset="utf-8"><title>Bet failed — Kalshi Agent</title></head><body style="margin:0;background:#0b1220;"><div style="{_BET_STYLE}">{inner}</div></body></html>'
     bet = outcome.get("bet") or {}
     env = outcome.get("env") or "live"
@@ -1201,7 +1201,7 @@ def render_bet_result(outcome: dict) -> str:
 <div style="color:#38bdf8;margin-top:10px;font-size:15px;">TOTAL FUNDS now: <b>{funds_txt}</b></div>
 </div>
 <div style="color:#64748b;font-size:12px;margin-bottom:14px;">Funds were re-pulled from Kalshi right after this order — the dashboard tile shows the same fresh number.</div>
-<a href="{base}/" style="color:#93c5fd;">&larr; back to dashboard</a>"""
+<a href="{base}/dashboard" style="color:#93c5fd;">&larr; back to dashboard</a>"""
     return f'<!doctype html><html><head><meta charset="utf-8"><title>Bet placed — Kalshi Agent</title></head><body style="margin:0;background:#0b1220;"><div style="{_BET_STYLE}">{inner}</div></body></html>'
 
 
@@ -1209,7 +1209,7 @@ def render_bet_error(msg: str, prompt_value: str = "") -> str:
     base = _base()
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>Bet — Kalshi Agent</title></head>
 <body style="margin:0;background:#0b1220;"><div style="{_BET_STYLE}">
-<a href="{base}/" style="color:#64748b;font-size:12px;text-decoration:none;">&larr; back to dashboard</a>
+<a href="{base}/dashboard" style="color:#64748b;font-size:12px;text-decoration:none;">&larr; back to dashboard</a>
 <h1 style="font-size:20px;margin:18px 0 8px;">Couldn't stage that bet</h1>
 <div style="background:#450a0a;border:1px solid #b91c1c;border-radius:8px;padding:12px 14px;color:#fca5a5;white-space:pre-wrap;margin-bottom:14px;">{_esc(msg)}</div>
 {_panel('ASK TO PLACE A BET', _bet_form(base, prompt_value))}
@@ -1226,6 +1226,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._html(render_credentials(self.dashboard))
         else:
             self._html(self.dashboard.render_page())
+
+    def _dashboard_page(self) -> None:
+        self._html(self.dashboard.render_page())
 
     def _html(self, text: str, content_type: str = "text/html; charset=utf-8",
               extra_headers: list[tuple[str, str]] | None = None,
@@ -1303,6 +1306,8 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/":
             self._page()
+        elif path == "/dashboard":
+            self._dashboard_page()
         elif path == "/credentials":
             self._html(render_credentials(self.dashboard))
         elif path == "/credentials/private.pem":
@@ -1430,7 +1435,7 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/bet/cancel":
                 token = (form.get("token") or [""])[0]
                 dash.pending_pop(token)
-                self._redirect(base + "/")
+                self._redirect(base + "/dashboard")
                 return
             if path == "/bet/confirm":
                 token = (form.get("token") or [""])[0]
@@ -1444,7 +1449,7 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 proposal, immediate = self._parse_proposal(prompt)
                 if immediate == "__FUNDS__":
-                    self._redirect(base + "/")
+                    self._redirect(base + "/dashboard")
                     return
                 if immediate:
                     self._html(render_bet_error(immediate, prompt))

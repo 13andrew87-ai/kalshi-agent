@@ -36,6 +36,6 @@ VOLUME ["/app/state"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4).read()" || exit 1
 
-# Default: web dashboard (paper/sim agent, credentials landing).
+# Default: web dashboard (TOTAL FUNDS + bet box live here; credentials reachable via /credentials).
 # For REAL-MONEY trading see DEPLOY.md — never enabled by default.
-CMD ["python", "-m", "kalshi_agent.cli", "web", "--port", "8080", "--mode", "sim", "--landing", "credentials"]
+CMD ["python", "-m", "kalshi_agent.cli", "web", "--port", "8080", "--mode", "sim"]
