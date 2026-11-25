@@ -1,0 +1,33 @@
+# Fly.io deployment (https://fly.io/docs/launch/)
+# 1. fly auth login
+# 2. fly launch --no-deploy --copy-config    (uses this file; pick your app name)
+# 3. fly secrets set KALSHI_WEB_PASSWORD='pick-a-strong-one'
+# 4. fly volumes create kalshi_state --size 1
+# 5. fly deploy
+
+app = "kalshi-agent"
+primary_region = "phx"   # Phoenix (user is in Phoenix, AZ) — change if unavailable
+
+[build]
+
+[env]
+  PORT = "8080"
+  KALSHI_PRIVATE_KEY_PATH = "/app/state/credentials/kalshi_private_key.pem"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false   # keep the trading agent alive; do NOT scale to zero
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "15s"
+  method = "GET"
+  path = "/healthz"
+
+[mounts]
+  source = "kalshi_state"
+  destination = "/app/state"

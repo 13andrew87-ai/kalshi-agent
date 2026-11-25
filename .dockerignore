@@ -1,0 +1,23 @@
+# Secrets and live state must NEVER enter the build context.
+.git/
+.gitignore
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+state/
+reports/
+tests/
+
+*.pem
+*.key
+.env
+.env.*
+
+Dockerfile
+.dockerignore
+docker-compose.yml
+render.yaml
+fly.toml
+DEPLOY.md

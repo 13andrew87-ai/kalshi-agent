@@ -1,0 +1,22 @@
+# Convenience for self-hosting. Secrets come from your shell or a local .env
+# file (NEVER committed). Example:
+#   export KALSHI_WEB_PASSWORD='pick-a-strong-one'
+#   docker compose up -d --build
+services:
+  web:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # REQUIRED — the gate fails closed without it
+      KALSHI_WEB_PASSWORD: ${KALSHI_WEB_PASSWORD:?set KALSHI_WEB_PASSWORD (see DEPLOY.md)}
+      # Live trading (REAL MONEY) — leave unset unless you know exactly what you want:
+      KALSHI_API_KEY_ID: ${KALSHI_API_KEY_ID:-}
+      KALSHI_PRIVATE_KEY_PATH: ${KALSHI_PRIVATE_KEY_PATH:-}
+      KALSHI_LIVE_CONFIRM: ${KALSHI_LIVE_CONFIRM:-}
+    volumes:
+      - kalshi-state:/app/state
+    restart: unless-stopped
+
+volumes:
+  kalshi-state:

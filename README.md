@@ -224,3 +224,11 @@ Arena session — the URL looks like `https://<sandbox-id>.arena.site/`).
 - Durability: the public URL lives as long as this sandbox and the web
   process live. A permanent host requires your own infrastructure (see above) —
   treat this as published-but-ephemeral, not production hosting.
+
+## Deployment
+
+Self-hosting / production: see **DEPLOY.md** — includes a secret-free
+`Dockerfile` (fail-closed gate), `docker-compose.yml`, a Fly.io blueprint
+(`fly.toml`), a Render blueprint (`render.yaml`), and step-by-step notes for a
+named Cloudflare tunnel. The image never contains credentials; everything is
+injected at runtime via env vars + a `state` volume.

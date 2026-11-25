@@ -1,0 +1,21 @@
+# Render.com blueprint (https://render.com/docs/blueprint-spec)
+# 1. Push this repo to GitHub (see README — git history is secret-free)
+# 2. Render dashboard -> New -> Blueprint -> pick the repo
+# 3. Set KALSHI_WEB_PASSWORD in the Render UI when prompted (never in git)
+services:
+  - type: web
+    name: kalshi-agent
+    runtime: docker
+    plan: starter          # free tier works for the dashboard, but sleeps on idle
+    healthCheckPath: /healthz
+    envVars:
+      - key: KALSHI_WEB_PASSWORD
+        sync: false        # set in dashboard — required, never committed
+      - key: KALSHI_PRIVATE_KEY_PATH
+        value: /app/state/credentials/kalshi_private_key.pem
+    # For persistence of generated keys across deploys, add a disk:
+    # disk:
+    #   name: kalshi-state
+    #   mountPath: /app/state
+    #   sizeGB: 1
+    # (disks require a paid instance type on Render)
