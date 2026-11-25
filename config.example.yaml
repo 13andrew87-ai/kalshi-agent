@@ -1,0 +1,78 @@
+# Kalshi agent configuration — copy to config.yaml and edit.
+# All money values are integer CENTS unless the key name says otherwise.
+
+# ---------- identity / connectivity ----------
+api_key_id: ""                              # or env KALSHI_API_KEY_ID
+private_key_path: "kalshi_private_key.pem"  # or env KALSHI_PRIVATE_KEY_PATH
+use_demo_env: false                         # true -> demo.elections.kalshi.com (fake money)
+
+# ---------- trading mode ----------
+mode: paper                                 # paper | live
+live_trading_enabled: false                 # live requires this + --live + KALSHI_LIVE_CONFIRM=YES
+dry_run: true                               # live only: log orders instead of sending
+
+# ---------- bankroll ----------
+bankroll_cents: 100000                      # $1,000 starting paper cash
+
+# ---------- strategy ----------
+kelly_fraction: 0.10
+min_edge_cents: 6                           # model prob must beat the ask by this, AFTER fees
+min_ev_cents: 0.5
+max_price_cents: 92
+min_price_cents: 8
+max_contracts_per_order: 250
+order_type: ioc                             # live orders: fill-now-or-cancel (safer)
+
+# ---------- risk limits ----------
+max_pct_bankroll_per_market: 2.0
+max_total_exposure_pct: 15.0
+max_open_positions: 8
+daily_loss_limit_pct: 5.0                   # halt for the day after -5% realized
+consecutive_loss_kill: 6
+min_cash_reserve_pct: 20.0
+stop_loss_pct: 0.0              # %-of-stake exits disabled — cents rule won the backtest sweep
+take_profit_pct: 0.0            # (15c stop / +5c take-profit, best of 16 combos x 3 seeds)
+stop_loss_cents: 15             # sell at 15c below entry
+take_profit_cents: 5            # sell at 5c above entry (validated)
+max_close_hours_ahead: 504                  # 21 days
+min_hours_to_close: 1.0
+cooldown_minutes_after_loss: 60
+ticker_whitelist: []                        # empty = all allowed
+ticker_blacklist: []
+
+# ---------- universe filter ----------
+categories: []                              # e.g. [Sports, Economics]; empty = all
+min_liquidity_cents: 10000                  # $100 resting depth
+min_volume: 100
+scan_limit: 200
+
+# ---------- predictor weights ----------
+w_consensus: 0.30
+w_momentum: 0.10
+w_ema: 0.30
+w_base_rate: 0.30
+momentum_lookback: 12
+reversion_lookback: 24
+min_confidence: 0.35
+base_rates_path: ""                         # optional YAML {Category: base_rate}
+
+# ---------- fees ----------
+taker_fee_multiplier: 0.07                  # Kalshi: fee = 0.07 * C * P * (1-P)
+
+# ---------- engine ----------
+poll_seconds: 30
+web_sim_poll_seconds: 2.0                  # dashboard: real seconds per sim cycle
+web_paper_poll_seconds: 30.0               # dashboard: seconds between paper cycles
+rate_limit_per_sec: 8.0
+state_dir: state
+reports_dir: reports
+candle_interval_minutes: 60
+candle_lookback_hours: 168
+log_level: INFO
+
+# ---------- demo / backtest ----------
+demo_seed: 42
+demo_markets: 18
+demo_cycles: 96
+demo_hours_per_cycle: 3.0
+backtest_episodes: 40

@@ -1,0 +1,48 @@
+# LIVE production config — api.elections.kalshi.com, REAL money.
+# Sized for the current validated balance ($3.00): one-contract clips,
+# tiny exposure, everything else identical to the validated defaults.
+mode: live
+live_trading_enabled: true
+dry_run: false               # LIVE: real orders (per explicit account-owner request)
+use_demo_env: false
+
+# --- tiny-balance overrides (balance-scaled caps would size to 0) ---
+kelly_fraction: 1.0          # full Kelly on a $3 bankroll still rounds to ~1 contract
+min_edge_cents: 8            # demand a fat edge to justify a concentrated clip
+max_price_cents: 30          # only cheap contracts: max ~30c risk per contract
+max_contracts_per_order: 2
+max_pct_bankroll_per_market: 50.0
+max_total_exposure_pct: 50.0
+max_open_positions: 4
+daily_loss_limit_pct: 15.0   # $0.45 on $3 — halts the day after ~1.5 losing clips
+min_cash_reserve_pct: 10.0
+
+# --- everything else: validated production defaults ---
+min_price_cents: 8
+order_type: ioc
+stop_loss_pct: 0.0              # %-of-stake exits disabled — cents rule won the backtest sweep
+take_profit_pct: 0.0            # (15c stop / +5c take-profit, best of 16 combos x 3 seeds)
+stop_loss_cents: 15             # sell at 15c below entry
+take_profit_cents: 5            # sell at 5c above entry (validated)
+cooldown_minutes_after_loss: 60
+consecutive_loss_kill: 6
+categories: []
+series_watchlist:                           # verified liquid series (2026-11 probe)
+  - KXNFLGAME
+  - KXNBAGAME
+  - KXNHLGAME
+  - KXEPLGAME
+  - KXEFOOTBALLGAME
+  - KXFED
+  - KXNBAPTS
+  - KXNFLPASSYDS
+min_liquidity_cents: 5000
+min_volume: 50
+scan_limit: 40
+poll_seconds: 45
+rate_limit_per_sec: 8.0
+state_dir: state
+reports_dir: reports
+candle_interval_minutes: 60
+candle_lookback_hours: 168
+log_level: INFO
