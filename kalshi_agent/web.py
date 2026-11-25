@@ -46,7 +46,7 @@ from urllib.parse import parse_qs
 
 from .agent import Agent
 from .auth import KalshiSigner, generate_keypair
-from .brokers import PaperBroker
+from .brokers import PaperBroker, _fp_count, _fp_price_cents, _fp_fee_cents
 from .client import KalshiClient, KalshiApiError
 from .config import AppConfig, DEFAULT_BASE_URL, DEMO_BASE_URL
 from .models import OrderBook
@@ -201,7 +201,7 @@ class WebDashboard:
 
     def __init__(self, cfg: AppConfig, mode: str = "sim"):
         self.cfg = cfg
-        self.mode = mode if mode in ("sim", "paper") else "sim"
+        self.mode = mode if mode in ("sim", "paper", "account") else "sim"
         self._control_lock = threading.RLock()
         self._display_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -224,6 +224,13 @@ class WebDashboard:
         self._live_cfg, self._live_cfg_ok = webbets.load_live_cfg()
         self._funds_cache: dict = {"cents": None, "as_of": 0.0, "env": "", "error": ""}
         self._pending_bets: dict[str, dict] = {}   # token -> staged bet (120 s TTL)
+        self._chat: list[tuple[str, str]] = [
+            ("app", "Real-money console. Type a bet — ticket or plain English — e.g. "
+                    "“buy 1 yes KXNBAGAME-26NOV25-LAL 22c” or “close out my chiefs bet”. "
+                    "I’ll stage it and ask YES/NO before anything is sent."),
+        ]
+        self._chat_pending: str | None = None        # token of the bet awaiting YES/NO
+        self._account_cache: dict = {"ts": 0.0, "positions": None, "fills": None, "error": ""}
 
         self.display: dict = {
             "mode": self.mode, "running": False, "cycles": 0, "started_ts": None,
@@ -232,7 +239,12 @@ class WebDashboard:
             "positions": [], "closed": [], "risk": {}, "signals": [],
             "equity_history": [], "last_res": {}, "universe_seed": None,
         }
-        self._build_world()
+        if self.mode != "account":
+            self._build_world()
+        else:
+            self.sim = None
+            self.portfolio = None
+            self.agent = None
 
     # ------------------------------------------------------------- world ---
     def _cred_dir(self) -> str:
@@ -582,6 +594,9 @@ class WebDashboard:
             else self.cfg.web_paper_poll_seconds
 
     def start(self) -> None:
+        if self.mode == "account":
+            log.warning("account mode: no agent loop — real money moves only via the prompt box")
+            return
         with self._control_lock:
             if self._worker and self._worker.is_alive():
                 return
@@ -715,7 +730,81 @@ class WebDashboard:
                     "fills": res.fills,
                 }
 
+    def _account_state(self, force: bool = False) -> dict:
+        """Live positions + recent fills straight from Kalshi (cached 20 s)."""
+        c = self._account_cache
+        now = time.time()
+        if not force and c["positions"] is not None and now - c["ts"] < 20:
+            return dict(c)
+        out = {"ts": now, "positions": [], "fills": [], "error": ""}
+        cred = self.credentials
+        if not cred.get("validated"):
+            out["error"] = "save + validate credentials first"
+            self._account_cache = out
+            return out
+        try:
+            client = self._signed_client()
+            raw_positions = client.get_positions("open") or []
+            positions = []
+            exposure_cents = 0
+            for rp in raw_positions:
+                net = webbets._fp(rp.get("position_fp") or rp.get("position") or 0)
+                if abs(net) < 1e-9:
+                    continue
+                exp = webbets.exposure_cents(rp)
+                exposure_cents += exp
+                positions.append({
+                    "ticker": str(rp.get("ticker") or rp.get("market_ticker") or "?"),
+                    "side": "YES" if net > 0 else "NO",
+                    "count": int(abs(net)),
+                    "exposure_cents": exp,
+                    "realized_pnl_cents": None,
+                })
+            out["positions"] = positions
+            out["exposure_cents"] = exposure_cents
+            try:
+                raw_fills = client.get_fills(limit=8) or []
+                fills = []
+                for fr in raw_fills:
+                    cnt = _fp_count(fr.get("count_fp"), fr.get("count"), fr.get("quantity"))
+                    if cnt <= 0:
+                        continue
+                    fills.append({
+                        "ticker": str(fr.get("ticker") or "?"),
+                        "action": str(fr.get("action") or "").lower(),
+                        "side": str(fr.get("side") or "").lower(),
+                        "count": cnt,
+                        "price_cents": _fp_price_cents(fr, 0),
+                        "fee_cents": _fp_fee_cents(fr),
+                        "ts": fr.get("created_time") or fr.get("ts") or fr.get("timestamp") or "",
+                    })
+                out["fills"] = fills
+            except Exception as exc:  # noqa: BLE001
+                log.warning("account: fills fetch failed: %s", exc)
+                out["fills"] = []
+        except KalshiApiError as exc:
+            hint = " — re-validate credentials" if exc.status in (401, 403) else ""
+            out["error"] = f"positions fetch failed ({exc.status}){hint}"
+        except Exception as exc:  # noqa: BLE001
+            out["error"] = f"positions fetch failed: {exc}"
+        self._account_cache = out
+        return dict(out)
+
+    def chat(self, role: str, text: str) -> None:
+        self._chat.append((role, str(text)))
+        self._chat = self._chat[-40:]
+
     def state(self) -> dict:
+        if self.mode == "account":
+            d = dict(self.display)
+            d["running"] = False
+            d["now"] = time.time()
+            d["logs"] = list(self.log_handler.ring)[-40:]
+            d["funds"] = self.funds_snapshot()
+            d["account"] = self._account_state()
+            d["chat"] = list(self._chat)
+            d["mode"] = "account"
+            return d
         with self._display_lock:
             d = dict(self.display)
         d["running"] = bool(self._worker and self._worker.is_alive()
@@ -727,6 +816,8 @@ class WebDashboard:
 
     # ------------------------------------------------------------ rendering ---
     def render_page(self) -> str:
+        if self.mode == "account":
+            return render_account_page(self)
         s = self.state()
         eq = s["equity_cents"] / 100
         ret = s["return_pct"]
@@ -1093,6 +1184,11 @@ def _sel_style() -> str:
             "padding:7px 8px;font-size:13px;font-family:inherit;margin-right:6px;")
 
 
+YES_WORDS = {"yes", "y", "yeah", "yep", "yup", "affirmative", "confirm",
+             "send", "send it", "do it", "approve", "go", "go ahead"}
+NO_WORDS = {"no", "n", "nope", "negative", "cancel", "abort", "stop",
+            "don't", "dont", "never mind", "nevermind"}
+
 def _fmt_usd(cents) -> str:
     return f"{(cents or 0) / 100:,.2f}$"
 
@@ -1164,6 +1260,145 @@ def _bet_checks_rows(checks: list) -> str:
 
 
 _BET_STYLE = "max-width:720px;margin:0 auto;padding:20px;color:#e2e8f0;font-family:ui-monospace,Menlo,Consolas,monospace;"
+
+
+def render_account_page(dash: "WebDashboard") -> str:
+    """Real-money console: signed Kalshi funds, live positions/fills, bet chat.
+    No sim/paper agent — nothing on this page can trade autonomously."""
+    base = _base()
+    s = dash.state()
+    cred = dash.credentials
+    env = cred.get("env") or "live"
+    label, accent = _env_label(env)
+    funds = s["funds"]
+    acct = s.get("account") or {}
+    positions = acct.get("positions") or []
+    fills = acct.get("fills") or []
+    acct_err = acct.get("error") or ""
+    exposure = acct.get("exposure_cents")
+    if exposure is None:
+        exposure = sum(p.get("exposure_cents", 0) for p in positions)
+
+    # ---- transcript ----
+    bubbles = []
+    for role, text in (s.get("chat") or [])[-24:]:
+        who = "YOU" if role == "you" else "AGENT"
+        color = "#93c5fd" if role == "you" else "#c4b5fd"
+        bubbles.append(
+            '<div style="padding:6px 2px;border-bottom:1px solid #1e293b;">'
+            f'<span style="color:{color};font-size:10px;letter-spacing:1px;">{who}</span><br>'
+            f'<span style="white-space:pre-wrap;font-size:12px;color:#e2e8f0;">{_esc(text)}</span></div>')
+    transcript = "".join(bubbles) or '<div style="color:#64748b;font-size:12px;">…</div>'
+
+    # ---- positions table ----
+    if positions:
+        pos_rows = "".join(
+            f"<tr><td>{_esc(p['ticker'])}</td><td>{_esc(p['side'])}</td>"
+            f"<td>{p['count']}</td><td>{_fmt_usd(p['exposure_cents'])}</td></tr>"
+            for p in positions)
+        pos_html = ('<table style="width:100%;border-collapse:collapse;font-size:13px;">'
+                    '<tr style="color:#64748b;text-align:left;"><th>ticker</th><th>side</th>'
+                    f'<th>contracts</th><th>exposure</th></tr>{pos_rows}</table>')
+        open_n = len(positions)
+    else:
+        open_n = 0
+        pos_html = '<div style="color:#64748b;font-size:13px;">No open positions — nothing at risk.</div>'
+
+    # ---- fills table ----
+    if fills:
+        fill_rows = "".join(
+            f"<tr><td>{_esc(str(f['ts'])[:19].replace('T', ' '))}</td>"
+            f"<td>{_esc(str(f['action']).upper())} {_esc(str(f['side']).upper())}</td>"
+            f"<td>{_esc(f['ticker'])}</td><td>{f['count']}</td><td>{f['price_cents']}c</td>"
+            f"<td>{_fmt_usd(f['fee_cents'])}</td></tr>" for f in fills)
+        fills_html = ('<table style="width:100%;border-collapse:collapse;font-size:13px;">'
+                      '<tr style="color:#64748b;text-align:left;"><th>time (UTC)</th><th>side</th>'
+                      f'<th>ticker</th><th>qty</th><th>price</th><th>fee</th></tr>{fill_rows}</table>')
+    else:
+        fills_html = '<div style="color:#64748b;font-size:13px;">No recent fills.</div>'
+
+    acct_err_html = (
+        '<div style="background:#450a0a;border:1px solid #b91c1c;border-radius:8px;padding:10px 14px;'
+        f'margin-bottom:14px;color:#fca5a5;font-size:13px;">account read failed: {_esc(acct_err)}</div>'
+        if acct_err else "")
+
+    err = ""
+    if not cred.get("validated"):
+        err = ('<div style="background:#450a0a;border:1px solid #b91c1c;border-radius:8px;padding:12px 14px;'
+               'margin-bottom:14px;color:#fca5a5;font-size:13px;"><b>Credentials not validated on this '
+               'deployment.</b><br>Total funds and order placement need your key: '
+               f'<a href="{base}/credentials" style="color:#93c5fd;">API keys &amp; credentials</a> — '
+               'paste your private PEM → pick env (demo first!) → Save &amp; test. Your PEM goes '
+               'straight from this browser to the server over TLS.</div>')
+
+    llm_note = ("Claude connected for plain-English bets" if os.environ.get("ANTHROPIC_API_KEY")
+                else "ticket syntax only (no ANTHROPIC_API_KEY on server)")
+    caps = (f"max {dash._live_cfg.max_contracts_per_order} contracts/order · entries "
+            f"{dash._live_cfg.min_price_cents}–{dash._live_cfg.max_price_cents}c · "
+            "IOC limit · fee-aware · buys + closing sells (never shorts) · exits allowed under halt · "
+            "8¢ model edge gate not applied to manual bets · funds re-pulled after every order")
+
+    if funds.get("cents") is not None:
+        funds_big = _fmt_usd(funds["cents"])
+        funds_sub = f"signed exchange balance · as of {max(0, int(time.time() - funds.get('as_of', 0)))}s ago"
+    else:
+        funds_big = "—"
+        funds_sub = _esc(str(funds.get("error") or "unavailable"))
+
+    chat_panel_inner = (
+        f'<div style="background:#020617;border:1px solid #1e293b;border-radius:10px;'
+        f'padding:10px;height:260px;overflow-y:auto;margin-bottom:10px;">{transcript}</div>'
+        f'<form method="post" action="{base}/bet/chat" style="margin:0">'
+        f'<div style="display:flex;gap:8px;">'
+        f'<input type="text" name="prompt" autocomplete="off" autofocus required '
+        f'placeholder="buy 1 yes KXNBAGAME-… 22c · sell 1 yes KXNFLGAME-… · yes / no · funds · help" '
+        f'style="flex:1;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;'
+        f'padding:10px 12px;font-size:13px;font-family:inherit;">'
+        f'<button style="{_btn_style("#7c3aed")}">Send</button>'
+        f'</div></form>'
+        f'<div style="color:#64748b;font-size:11px;margin-top:8px;">{caps} · {_esc(llm_note)}</div>')
+
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>Kalshi — My Account</title></head>
+<body style="margin:0;background:#0b1220;color:#e2e8f0;font-family:ui-monospace,Menlo,Consolas,monospace;">
+<div style="max-width:960px;margin:0 auto;padding:20px;">
+
+<div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:4px;">
+<h1 style="font-size:22px;margin:0;">Kalshi <span style="color:#64748b;font-weight:normal;">— my account</span></h1>
+<span style="background:{accent}22;color:{accent};border:1px solid {accent};
+ padding:3px 10px;border-radius:999px;font-size:12px;">{_esc(label)}</span>
+<span style="background:#1e293b;color:#fca5a5;border:1px solid #334155;padding:3px 10px;border-radius:999px;font-size:12px;">MANUAL ONLY — NOTHING AUTO-SENDS</span>
+</div>
+<div style="color:#64748b;font-size:12px;margin-bottom:14px;">
+No simulated or paper trading here. Every order needs your explicit YES in the box below.
+&middot; <a href="{base}/dashboard" style="color:#93c5fd;">&#8635; refresh</a> &middot;
+<a href="{base}/credentials" style="color:#93c5fd;">&#128273; API keys</a> &middot;
+<form method="post" action="/logout" style="display:inline"><button style="background:none;border:none;color:#64748b;font-size:12px;cursor:pointer;text-decoration:underline;font-family:inherit;padding:0;">sign out</button></form></div>
+
+{err}{acct_err_html}
+
+<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;">
+<div style="background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:14px 18px;min-width:220px;">
+<div style="color:#64748b;font-size:11px;letter-spacing:1px;">TOTAL FUNDS · KALSHI <span style="color:{accent};">{_esc(label)}</span></div>
+<div style="font-size:30px;font-weight:bold;color:#38bdf8;margin:6px 0;">{funds_big}</div>
+<div style="color:#64748b;font-size:11px;">{funds_sub}</div>
+</div>
+{_card('OPEN POSITIONS', str(open_n), f"max {dash._live_cfg.max_open_positions} (config-live.yaml)")}
+{_card('TOTAL EXPOSURE', _fmt_usd(exposure), 'cost basis per Kalshi')}
+{_card('AUTOMATION', 'OFF', 'every order needs your YES', '#eab308')}
+</div>
+
+{_panel('ASK TO PLACE A BET', chat_panel_inner)}
+
+{_panel(f'OPEN POSITIONS ({open_n}) — live from Kalshi', pos_html)}
+
+{_panel('RECENT FILLS', fills_html)}
+
+<div style="color:#475569;font-size:11px;margin-top:18px;">
+Simulated/paper trading is not shown on this deployment. Real-money orders go to Kalshi only after you type YES.
+IOC limit orders — unfilled remainders are cancelled automatically. Fees are estimates (7% of C×P×(1−P)); the exchange's
+ledger is authoritative. Not financial advice. Parameters: exactly those in config-live.yaml.</div>
+</div></body></html>"""
 
 
 def render_bet_confirm(dash: "WebDashboard", bet: dict, token: str, error: str = "") -> str:
@@ -1484,10 +1719,101 @@ class _Handler(BaseHTTPRequestHandler):
                      "rationale": out.get("rationale", "")}, None)
         return (None, out.get("message") or "couldn't turn that into a bet")
 
+    def _stage_from_prompt(self, prompt: str) -> None:
+        """Parse → validate → either chat a YES/NO challenge or refuse."""
+        dash = self.dashboard
+        clean = prompt.strip()
+        low = clean.lower()
+        if low in ("funds", "balance", "cash", "refresh"):
+            f = dash.funds_snapshot(force=True)
+            txt = (f"TOTAL FUNDS ({(f.get('env') or 'live').upper()}): "
+                   + (_fmt_usd(f["cents"]) if f.get("cents") is not None
+                      else str(f.get("error") or "unavailable")))
+            dash.chat("app", txt)
+            return
+        if low in ("help", "?"):
+            dash.chat("app", "I understand:\n"
+                             "• buy N yes|no TICKER [at Xc]   e.g. buy 1 yes KXNBA-26NOV25-LAL 22c\n"
+                             "• sell N yes|no TICKER [at Xc]  — closes what you hold\n"
+                             "• or plain English if Claude is configured\n"
+                             "• funds — re-pull your Kalshi balance\n"
+                             "• yes / no — answer a pending bet\n"
+                             "Nothing is ever sent without your YES.")
+            return
+        proposal, immediate = self._parse_proposal(prompt)
+        if proposal is None:
+            dash.chat("app", immediate if immediate != "__FUNDS__" else "funds refreshed — see the tile above.")
+            return
+        action = proposal.pop("action", "buy")
+        staged = dash.stage_order(action, **proposal)
+        if not staged.get("ok"):
+            failed = [f"✗ {lbl} — {dtl}" for lbl, ok, dtl in (staged.get("bet") or {}).get("checks", [])
+                      if not ok]
+            msg = f"Could not stage that: {staged.get('error')}"
+            if failed:
+                msg += "\n" + "\n".join(failed)
+            dash.chat("app", msg)
+            return
+        bet = staged["bet"]
+        token = dash.stage_pending(bet)
+        dash._chat_pending = token
+        verb = "BUY" if action == "buy" else "SELL"
+        cash_line = (f"total cost ≈ {_fmt_usd(bet['cost_cents'])} (incl. ~{_fmt_usd(bet['fee_cents'])} fee)"
+                     if action == "buy" else
+                     f"net proceeds ≈ {_fmt_usd(bet.get('proceeds_cents', 0))} after ~{_fmt_usd(bet['fee_cents'])} fee")
+        cap_line = "caps: all checks pass (config-live.yaml, exchange-verified)"
+        dash.chat("app",
+                  f"{verb} {bet['count']} × {bet['side'].upper()} · {bet['ticker']}\n"
+                  f"{bet.get('title') or ''}\n"
+                  f"limit {bet['price_cents']}c (IOC) · {cash_line}\n"
+                  f"balance after ≈ {_fmt_usd(bet['balance_before_cents'] + (bet.get('proceeds_cents', 0) if action == 'sell' else -bet['cost_cents']))}\n"
+                  f"{cap_line}\n\n"
+                  f"Reply YES to send it, or NO to cancel. (2-minute expiry)")
+
     def _handle_bet_post(self, path: str, form: dict) -> None:
         dash = self.dashboard
         base = _base()
         try:
+            if path == "/bet/chat":
+                prompt = (form.get("prompt") or [""])[0].strip()
+                if not prompt:
+                    self._redirect(base + "/dashboard")
+                    return
+                low = prompt.lower()
+                dash.chat("you", prompt)
+                pending = dash._chat_pending
+                if low in YES_WORDS:
+                    if pending:
+                        dash._chat_pending = None
+                        outcome = dash.confirm_pending(pending)
+                        if outcome.get("ok"):
+                            bet = outcome.get("bet") or {}
+                            funds = outcome.get("funds") or {}
+                            funds_txt = (_fmt_usd(funds["cents"])
+                                         if funds.get("cents") is not None
+                                         else str(funds.get("error") or "refresh failed"))
+                            dash.chat("app",
+                                      f"✅ Order sent. {str(bet.get('action', 'buy')).upper()} "
+                                      f"{bet.get('count')} × {str(bet.get('side', '')).upper()} "
+                                      f"{bet.get('ticker')} @ {bet.get('price_cents')}c · filled {outcome.get('filled')} of "
+                                      f"{bet.get('count')} (IOC — unfilled remainder cancelled)\n"
+                                      f"order id: {outcome.get('order_id') or '-'}\n"
+                                      f"TOTAL FUNDS now: {funds_txt}")
+                        else:
+                            dash.chat("app", f"❌ Not sent — {outcome.get('error', 'unknown error')}")
+                    else:
+                        dash.chat("app", "Nothing waiting for a YES — describe a bet first (type help).")
+                elif low in NO_WORDS:
+                    if pending:
+                        dash._chat_pending = None
+                        dash.pending_pop(pending)
+                        dash.chat("app", "Cancelled — nothing was sent.")
+                    else:
+                        dash.chat("app", "Nothing pending. (Yes, I know you hate confirmation pages.)")
+                else:
+                    self._stage_from_prompt(prompt)
+                self._redirect(base + "/dashboard")
+                return
             if path == "/bet/cancel":
                 token = (form.get("token") or [""])[0]
                 dash.pending_pop(token)

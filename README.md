@@ -42,6 +42,12 @@ open reports/status.html
 data** (public endpoints, paper fills). The autonomous agent never gets web-based
 real-money control — it stays behind the CLI gates described below.
 
+### The production deployment runs the real-money account console
+
+`--mode account` (what Fly.io runs): no simulator, no paper agent, no autonomous loop of any kind.
+The dashboard is your signed Kalshi account — total funds, live positions and recent fills pulled
+straight from the exchange, plus a bet box. Locally, `--mode sim|paper` still exist for rehearsal.
+
 ### The "Ask to place a bet" prompt box
 
 The dashboard also has a manual bet box (top of page), for discretionary bets:
@@ -52,11 +58,13 @@ The dashboard also has a manual bet box (top of page), for discretionary bets:
   to the best ask) — or plain English; with `ANTHROPIC_API_KEY` set on the server,
   Claude Haiku interprets the request and may only name real, currently-open markets
   from the watchlist series. Without the key, ticket syntax still works.
-- **Nothing is sent automatically.** You get a confirmation page with the exact order,
-  fees, balance-before/after, and every hard cap from `config-live.yaml` re-checked
-  against fresh exchange state (contracts per order, price band, cash reserve,
-  open-position limit, per-market and total exposure, risk halt). Confirm is
-  single-use, expires after 2 minutes, and re-validates everything at send time.
+- **Nothing is sent automatically — and the confirmation happens right inside the box.**
+  Type your bet, the box replies with the full order summary (side, size, limit, IOC,
+  fees, total cost, balance after, and caps re-checked against fresh exchange state —
+  contracts per order, price band, cash reserve, open-position limit, per-market and
+  total exposure, risk halt). Answer **YES** to send it or **NO** to cancel — no extra
+  page. Pending proposals are single-use and expire after 2 minutes, and everything is
+  re-validated at send time.
 - **Buys and sells that close existing positions — never shorts.** Selling is validated
   against the exchange's own position (signed `position_fp`), IOC limit, fee-aware; exits
   are permitted even under a risk halt (a halt stops new bets, not de-risking).

@@ -441,7 +441,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     w = add("web", "serve the live web dashboard (sim or paper-real-data)", cmd_web)
     w.add_argument("--port", type=int, default=8080)
-    w.add_argument("--mode", default="sim", choices=["sim", "paper"])
+    w.add_argument("--mode", default="sim", choices=["sim", "paper", "account"],
+                   help="account = real-money console: signed funds + manual-only prompt box, no agent/simulator")
     w.add_argument("--scan-limit", type=int, help="cap markets scanned per cycle (paper mode)")
     w.add_argument("--no-autostart", action="store_true", help="don't start the agent on boot")
     w.add_argument("--landing", default="dashboard", choices=["dashboard", "credentials"],
