@@ -217,3 +217,108 @@ def test_full_flow_via_http(monkeypatch):
     body = opener.open(req, timeout=5).read().decode()
     assert "Bet not placed" in body
     httpd.shutdown()
+
+
+# ------------------------------------------------------------------ sells ---
+def test_parse_sell_ticket():
+    p = webbets.parse_bet_prompt("sell 2 yes KXNFLGAME-X 28c")
+    assert p["ok"] and p["action"] == "sell" and p["count"] == 2 and p["price_cents"] == 28
+    p = webbets.parse_bet_prompt("sell 1 no KXNHL-Y")
+    assert p["ok"] and p["action"] == "sell" and p["price_cents"] is None
+
+
+def test_held_contracts_signed_fp():
+    pos = [{"ticker": "KXA-X", "position_fp": "2.00"},
+           {"ticker": "KXB-X", "position_fp": "-3.00"},
+           {"ticker": "KXC-X", "position_fp": "0.00"}]
+    assert webbets.held_contracts(pos, "KXA-X", "yes") == 2
+    assert webbets.held_contracts(pos, "KXA-X", "no") == 0
+    assert webbets.held_contracts(pos, "KXB-X", "no") == 3
+    assert webbets.held_contracts(pos, "KXB-X", "yes") == 0
+    assert webbets.held_contracts(pos, "KXC-X", "yes") == 0
+
+
+def test_assess_sell_requires_holding():
+    c = _cfg()
+    pos = [{"ticker": "KXNFLGAME-X", "position_fp": "1.00"}]
+    a = webbets.assess_sell(c, balance_cents=10_000, count=1, price_cents=20,
+                            ticker="KXNFLGAME-X", side="yes", positions=pos,
+                            halted=True, halt_reason="daily loss")
+    assert a["ok"], a["checks"]          # exits allowed even under halt
+    assert a["proceeds_cents"] == 20 - a["fee_cents"]
+    a = webbets.assess_sell(c, balance_cents=10_000, count=3, price_cents=20,
+                            ticker="KXNFLGAME-X", side="yes", positions=pos,
+                            halted=False, halt_reason="")
+    assert not a["ok"]                   # can't sell more than held
+    a = webbets.assess_sell(c, balance_cents=10_000, count=1, price_cents=20,
+                            ticker="KXNFLGAME-X", side="no", positions=pos,
+                            halted=False, halt_reason="")
+    assert not a["ok"]                   # you hold YES, not NO
+
+
+def test_interpret_sell_grounded_on_positions(monkeypatch):
+    cfg = _cfg()
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"content": [{"type": "text", "text": '{"action":"propose","order_side":"sell","ticker":"KXNFLGAME-X","side":"yes","count":1,"price_cents":null,"rationale":"close it"}'}]}
+
+    class _Sess:
+        def post(self, *a, **kw):
+            return _Resp()
+
+    pos = [{"ticker": "KXNFLGAME-X", "position_fp": "1.00"}]
+    out = webbets.interpret_with_claude("close out my chiefs bet", catalog=[], positions=pos,
+                                        cfg=cfg, api_key="k", session=_Sess())
+    assert out["action"] == "propose" and out["order_side"] == "sell"
+    # and the unheld case is refused
+    out = webbets.interpret_with_claude("close out my chiefs bet", catalog=[], positions=[],
+                                        cfg=cfg, api_key="k", session=_Sess())
+    assert out["action"] == "none"
+
+
+class _HeldClient(_FakeClient):
+    def get_positions(self, status="open"):
+        return [{"ticker": "KXNFLGAME-X", "position_fp": "2.00",
+                 "market_exposure_fp": "0.40"}]
+
+    def get_orderbook(self, ticker, depth=None):
+        return {"orderbook": {"yes": [[27, 10]], "no": [[70, 10]]}}   # yes bid 27c
+
+    def create_order(self, body):
+        super().create_order(body)
+        return {"order": {"order_id": "ord-sell-1", "taker_fill_count": body["count"]}}
+
+
+def test_full_sell_flow_via_http(tmp_path):
+    fake = _HeldClient()
+    cfg = AppConfig(); cfg.state_dir = str(tmp_path / "state"); cfg.reports_dir = str(tmp_path / "reports")
+    dash = WebDashboard(cfg, mode="sim")
+    dash.credentials.update({"key_id": "k" * 36, "pem": "-----BEGIN PRIVATE KEY-----x",
+                             "env": "demo", "validated": True, "fingerprint": "abc"})
+    dash._signed_client = lambda: fake
+
+    _Handler.dashboard = dash
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    opener.open(f"http://127.0.0.1:{port}/login",
+                data=b"password=unit-test-gate-password-9f3a", timeout=5).read()
+    import re as _re
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{_base()}/bet/preview",
+                                 data=b"prompt=sell+1+yes+KXNFLGAME-X")
+    body = opener.open(req, timeout=5).read().decode()
+    assert "SELL 1" in body and "net proceeds" in body
+    m = _re.search(r'name="token" value="([0-9a-f]{24})"', body)
+    assert m, body[:2000]
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{_base()}/bet/confirm",
+                                 data=f"token={m.group(1)}".encode())
+    body = opener.open(req, timeout=5).read().decode()
+    assert "Order sent to Kalshi" in body and "SELL 1" in body
+    assert fake.orders[0]["action"] == "sell" and fake.orders[0]["yes_price"] == 27
+    httpd.shutdown()

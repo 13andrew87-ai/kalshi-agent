@@ -9,8 +9,9 @@ Real-money live trading intentionally has NO web control from the autonomous age
 it stays behind the CLI's four opt-in gates (see README). The dashboard's
 “Ask to place a bet” prompt box is the single deliberate exception: every bet is
 proposed to a human, staged against hard risk caps from config-live.yaml, and
-sent to Kalshi only after an explicit per-bet confirmation (buys, IOC limit,
-fee-aware). See kalshi_agent/webbets.py.
+sent to Kalshi only after an explicit per-bet confirmation (buys and sells that
+close existing positions — never shorts; IOC limit, fee-aware). See
+kalshi_agent/webbets.py.
 
 Endpoints:
   GET  /           dashboard (server-rendered, meta-refresh every 5 s, no JS needed)
@@ -413,8 +414,22 @@ class WebDashboard:
 
     def stage_buy(self, *, ticker: str, side: str, count: int,
                   price_cents: int | None, rationale: str = "") -> dict:
-        """Validate a proposed BUY against live exchange state + risk caps.
+        """Validate a proposed BUY against live exchange state + risk caps."""
+        return self.stage_order("buy", ticker=ticker, side=side, count=count,
+                                price_cents=price_cents, rationale=rationale)
+
+    def stage_sell(self, *, ticker: str, side: str, count: int,
+                   price_cents: int | None, rationale: str = "") -> dict:
+        """Validate a proposed SELL (closing only what you hold; never a short).
+        Exits are permitted even under a risk halt."""
+        return self.stage_order("sell", ticker=ticker, side=side, count=count,
+                                price_cents=price_cents, rationale=rationale)
+
+    def stage_order(self, action: str, *, ticker: str, side: str, count: int,
+                    price_cents: int | None, rationale: str = "") -> dict:
+        """Validate a proposed order against live exchange state + caps.
         Returns {"ok": True, "bet": {...}} or {"ok": False, "error": str, ...}."""
+        action = "sell" if action == "sell" else "buy"
         cred = self.credentials
         if not cred.get("validated"):
             return {"ok": False, "error": "save + validate credentials first"}
@@ -428,20 +443,23 @@ class WebDashboard:
             return {"ok": False, "error": f"market lookup failed: {exc}"}
         status = str(market.get("status") or "").lower()
         if status and status not in ("open", "active"):
-            return {"ok": False, "error": f"{ticker} is '{status}' — only open markets can be bought"}
+            return {"ok": False, "error": f"{ticker} is '{status}' — only open markets can be traded"}
         title = str(market.get("title") or "")
-        # resolve price: explicit or best ask
+        # resolve price: explicit, else best ask (buy) / best bid (sell)
         if price_cents is None:
             try:
                 book = OrderBook.from_api(client.get_orderbook(ticker), ticker)
-                ask = book.best_ask(side)
+                touch = book.best_ask(side) if action == "buy" else book.best_bid(side)
             except Exception as exc:  # noqa: BLE001
                 return {"ok": False, "error": f"couldn't read the order book: {exc}"}
-            if ask is None:
-                return {"ok": False, "error": f"no one is selling {side.upper()} on {ticker} right now"}
-            price_cents = ask.price_cents
+            if touch is None:
+                return {"ok": False,
+                        "error": (f"no one is selling {side.upper()} on {ticker} right now"
+                                  if action == "buy"
+                                  else f"no one is buying {side.upper()} on {ticker} right now")}
+            price_cents = touch.price_cents
         fee = webbets.estimate_fee_cents(count, price_cents, self._live_cfg.taker_fee_multiplier)
-        spend = count * price_cents + fee
+        spend = count * price_cents + fee if action == "buy" else count * price_cents - fee
         try:
             bal = self._signed_client().get_balance()
             balance_cents = int(bal.get("balance") or 0)
@@ -449,11 +467,18 @@ class WebDashboard:
             return {"ok": False, "error": f"couldn't fetch your balance: {exc}"}
         positions = self._positions_open(client)
         halted, halt_reason = self._halt_state()
-        assessment = webbets.assess_buy(
-            self._live_cfg, balance_cents=balance_cents, count=count,
-            price_cents=price_cents, ticker=ticker, positions=positions,
-            halted=halted, halt_reason=halt_reason)
+        if action == "buy":
+            assessment = webbets.assess_buy(
+                self._live_cfg, balance_cents=balance_cents, count=count,
+                price_cents=price_cents, ticker=ticker, positions=positions,
+                halted=halted, halt_reason=halt_reason)
+        else:
+            assessment = webbets.assess_sell(
+                self._live_cfg, balance_cents=balance_cents, count=count,
+                price_cents=price_cents, ticker=ticker, side=side, positions=positions,
+                halted=halted, halt_reason=halt_reason)
         bet = {
+            "action": action,
             "ticker": ticker, "title": title, "side": side, "count": count,
             "price_cents": price_cents, "fee_cents": fee, "cost_cents": spend,
             "balance_before_cents": balance_cents, "rationale": rationale,
@@ -462,6 +487,9 @@ class WebDashboard:
             "max_contracts": self._live_cfg.max_contracts_per_order,
             "created": time.time(),
         }
+        if action == "sell":
+            bet["proceeds_cents"] = assessment.get("proceeds_cents", spend)
+            bet["held"] = assessment.get("held", 0)
         if not assessment["ok"]:
             return {"ok": False, "error": "risk caps blocked this bet — see the checks below",
                     "bet": bet}
@@ -494,9 +522,10 @@ class WebDashboard:
         if bet is None:
             return {"ok": False, "error": "that staged bet expired or was already used (2 min limit) — ask again"}
         # re-check EVERYTHING against fresh exchange state
-        staged = self.stage_buy(ticker=bet["ticker"], side=bet["side"],
-                                count=bet["count"], price_cents=bet["price_cents"],
-                                rationale=bet.get("rationale", ""))
+        staged = self.stage_order(bet.get("action", "buy"),
+                                  ticker=bet["ticker"], side=bet["side"],
+                                  count=bet["count"], price_cents=bet["price_cents"],
+                                  rationale=bet.get("rationale", ""))
         if not staged["ok"]:
             return {"ok": False,
                     "error": "refused at send time — " + str(staged.get("error", "risk caps no longer pass")),
@@ -504,7 +533,8 @@ class WebDashboard:
         fresh = staged["bet"]
         cfg = self._live_cfg
         from .models import Intent
-        intent = Intent(ticker=fresh["ticker"], side=fresh["side"], action="buy",
+        intent = Intent(ticker=fresh["ticker"], side=fresh["side"],
+                        action=fresh.get("action", "buy"),
                         count=fresh["count"], price_cents=fresh["price_cents"],
                         rationale=fresh.get("rationale", "") or "manual prompt-box bet")
         tif_map = {"ioc": "immediate_or_cancel", "gtc": "good_till_canceled",
@@ -523,7 +553,7 @@ class WebDashboard:
         else:
             body["no_price"] = intent.price_cents
         env = self.credentials.get("env") or "live"
-        log.warning("MANUAL BET (%s): %s", env.upper(), body)
+        log.warning("MANUAL BET %s (%s): %s", fresh.get("action", "buy").upper(), env.upper(), body)
         client = self._signed_client()
         try:
             resp = client.create_order(body)
@@ -1090,7 +1120,7 @@ def _funds_card(funds: dict) -> str:
 
 def _bet_form(base: str, prompt_value: str = "") -> str:
     return f'''<form method="post" action="{base}/bet/preview" style="margin:0">
-<textarea name="prompt" rows="2" placeholder="buy 1 yes KXNFLGAME-26NOV25-KC 25c  ·  or plain English: &quot;put a dollar on the Chiefs to win tonight&quot;" required
+<textarea name="prompt" rows="2" placeholder="buy 1 yes KXNFLGAME-26NOV25-KC 25c  ·  sell 1 yes KXNFLGAME-26NOV25-KC  ·  or plain English: &quot;close out my Chiefs bet&quot;" required
  style="width:100%;box-sizing:border-box;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:10px;font-size:13px;font-family:inherit;resize:vertical;">{_esc(prompt_value)}</textarea>
 <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:10px;flex-wrap:wrap;">
 <span style="color:#64748b;font-size:11px;">You see the full order + fees + risk checks BEFORE anything is sent. Nothing is ever sent automatically.</span>
@@ -1111,7 +1141,7 @@ def _bet_panel(dash: "WebDashboard", funds: dict, base: str) -> str:
     cfg_note = "config-live.yaml caps loaded" if dash._live_cfg_ok else "config-live.yaml NOT found — falling back to built-in defaults"
     caps = (f"max {dash._live_cfg.max_contracts_per_order} contracts/order · price band "
             f"{dash._live_cfg.min_price_cents}–{dash._live_cfg.max_price_cents}c · "
-            f"IOC limit · fee-aware · buys only · 8&cent; model edge gate does NOT apply to manual bets")
+            f"IOC limit · fee-aware · buys + closing sells (never shorts) · exits allowed under halt · 8&cent; model edge gate does NOT apply to manual bets")
     warning = ("<div style='background:#450a0a;border:1px solid #b91c1c;border-radius:8px;padding:8px 12px;"
                "margin-bottom:10px;color:#fca5a5;font-size:12px;'><b>REAL MONEY MODE</b> — confirming a bet "
                "sends an actual order to Kalshi. Double-check the market, price and size.</div>"
@@ -1137,7 +1167,26 @@ _BET_STYLE = "max-width:720px;margin:0 auto;padding:20px;color:#e2e8f0;font-fami
 
 
 def render_bet_confirm(dash: "WebDashboard", bet: dict, token: str, error: str = "") -> str:
+    action = "SELL" if bet.get("action") == "sell" else "BUY"
+    is_sell = action == "SELL"
     env = bet.get("env") or "live"
+    if not is_sell:
+        cost_rows = (
+            f'<tr><td style="color:#64748b;padding:2px 0;">order cost</td><td><b>{_fmt_usd(bet["count"] * bet["price_cents"])}</b></td></tr>'
+            f'<tr><td style="color:#64748b;padding:2px 0;">est. taker fee</td><td>{_fmt_usd(bet["fee_cents"])}</td></tr>'
+            f'<tr><td style="color:#64748b;padding:2px 0;">total at risk</td><td><b>{_fmt_usd(bet["cost_cents"])}</b></td></tr>'
+            f'<tr><td style="color:#64748b;padding:2px 0;">balance before</td><td>{_fmt_usd(bet["balance_before_cents"])}</td></tr>'
+            f'<tr><td style="color:#64748b;padding:2px 0;">balance after (if fully filled)</td><td>{_fmt_usd(bet["balance_before_cents"] - bet["cost_cents"])}</td></tr>'
+        )
+    else:
+        cost_rows = (
+            f'<tr><td style="color:#64748b;padding:2px 0;">gross proceeds</td><td><b>{_fmt_usd(bet["count"] * bet["price_cents"])}</b></td></tr>'
+            f'<tr><td style="color:#64748b;padding:2px 0;">est. taker fee</td><td>{_fmt_usd(bet["fee_cents"])}</td></tr>'
+            f'<tr><td style="color:#64748b;padding:2px 0;">net proceeds</td><td><b>{_fmt_usd(bet.get("proceeds_cents", 0))}</b></td></tr>'
+            f'<tr><td style="color:#64748b;padding:2px 0;">held before sale</td><td>{bet.get("held", "?")} &times; {_esc(bet["side"].upper())}</td></tr>'
+            f'<tr><td style="color:#64748b;padding:2px 0;">balance before</td><td>{_fmt_usd(bet["balance_before_cents"])}</td></tr>'
+            f'<tr><td style="color:#64748b;padding:2px 0;">balance after (if fully filled)</td><td>{_fmt_usd(bet["balance_before_cents"] + bet.get("proceeds_cents", 0))}</td></tr>'
+        )
     label, accent = _env_label(env)
     base = _base()
     loss_note = ("REAL MONEY" if env == "live" else "DEMO · play money")
@@ -1153,22 +1202,18 @@ def render_bet_confirm(dash: "WebDashboard", bet: dict, token: str, error: str =
 <div style="color:#64748b;font-size:12px;margin-bottom:14px;">This is the only step that can send anything. Review everything, then confirm.</div>
 {err_html}
 <div style="background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:16px;margin-bottom:14px;">
-<div style="font-size:16px;font-weight:bold;margin-bottom:4px;">BUY {bet['count']} &times; {_esc(bet['side'].upper())} &middot; {_esc(bet['ticker'])}</div>
+<div style="font-size:16px;font-weight:bold;margin-bottom:4px;">{action} {bet['count']} &times; {_esc(bet['side'].upper())} &middot; {_esc(bet['ticker'])}</div>
 <div style="color:#94a3b8;font-size:13px;margin-bottom:12px;">{_esc(bet.get('title') or '')}</div>
 <table style="width:100%;border-collapse:collapse;font-size:13px;">
 <tr><td style="color:#64748b;padding:2px 0;">limit price</td><td><b>{bet['price_cents']}c</b> per contract</td></tr>
-<tr><td style="color:#64748b;padding:2px 0;">order cost</td><td><b>{_fmt_usd(bet['count'] * bet['price_cents'])}</b></td></tr>
-<tr><td style="color:#64748b;padding:2px 0;">est. taker fee</td><td>{_fmt_usd(bet['fee_cents'])}</td></tr>
-<tr><td style="color:#64748b;padding:2px 0;">total at risk</td><td><b>{_fmt_usd(bet['cost_cents'])}</b></td></tr>
-<tr><td style="color:#64748b;padding:2px 0;">balance before</td><td>{_fmt_usd(bet['balance_before_cents'])}</td></tr>
-<tr><td style="color:#64748b;padding:2px 0;">balance after (if fully filled)</td><td>{_fmt_usd(bet['balance_before_cents'] - bet['cost_cents'])}</td></tr>
-<tr><td style="color:#64748b;padding:2px 0;">order type</td><td>limit &middot; {_esc(dash._live_cfg.order_type.upper())} &middot; buys only</td></tr>
+{cost_rows}
+<tr><td style="color:#64748b;padding:2px 0;">order type</td><td>limit &middot; {_esc(dash._live_cfg.order_type.upper())} &middot; {'sells close what you hold — never shorts' if is_sell else 'IOC · buys'}</td></tr>
 </table>
 {f'<div style="margin-top:10px;color:#c4b5fd;font-size:12px;border-left:3px solid #7c3aed;padding-left:10px;">rationale: {_esc(bet.get("rationale") or "")}</div>' if bet.get("rationale") else ''}
 </div>
 <div style="margin-bottom:14px;">{_panel('RISK CHECKS — config-live.yaml standards, exchange-state verified', _bet_checks_rows(bet.get('checks') or []))}</div>
 <div style="display:flex;gap:10px;align-items:center;">
-<form method="post" action="{base}/bet/confirm" style="margin:0"><input type="hidden" name="token" value="{_esc(token)}"><button {confirm_disabled} style="{confirm_style}">{'&#128293; SEND REAL ORDER' if env == 'live' else 'Place demo order'}</button></form>
+<form method="post" action="{base}/bet/confirm" style="margin:0"><input type="hidden" name="token" value="{_esc(token)}"><button {confirm_disabled} style="{confirm_style}">{('&#128293; SEND REAL SELL' if is_sell else '&#128293; SEND REAL ORDER') if env == 'live' else ('Place demo sell' if is_sell else 'Place demo order')}</button></form>
 <form method="post" action="{base}/bet/cancel" style="margin:0"><input type="hidden" name="token" value="{_esc(token)}"><button style="{_btn_style('#374151')}">Cancel</button></form>
 <span style="color:#64748b;font-size:11px;">single-use token · expires 2 min after it was created · {loss_note}</span>
 </div>
@@ -1187,17 +1232,20 @@ def render_bet_result(outcome: dict) -> str:
         inner += f'<div style="margin-top:16px;"><a href="{base}/dashboard" style="color:#93c5fd;">&larr; back to dashboard</a></div>'
         return f'<!doctype html><html><head><meta charset="utf-8"><title>Bet failed — Kalshi Agent</title></head><body style="margin:0;background:#0b1220;"><div style="{_BET_STYLE}">{inner}</div></body></html>'
     bet = outcome.get("bet") or {}
+    action = "SELL" if bet.get("action") == "sell" else "BUY"
     env = outcome.get("env") or "live"
     filled = outcome.get("filled", 0)
+    zero_note = ('<div style="color:#eab308;font-size:12px;margin-top:8px;">IOC limit found no counterparties at that price — nothing filled. No position was changed.</div>' if filled == 0 else '')
     order_id = outcome.get("order_id") or "-"
     funds = outcome.get("funds") or {}
     funds_txt = (f"{_fmt_usd(funds.get('cents'))}" if funds.get("cents") is not None
                  else _esc(str(funds.get("error") or "refresh failed — will retry on next dashboard load")))
     inner = f"""<h1 style="font-size:20px;margin:18px 0 8px;color:#22c55e;">Order sent to Kalshi</h1>
 <div style="background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:16px;margin-bottom:14px;font-size:13px;">
-<div style="font-size:15px;font-weight:bold;margin-bottom:8px;">BUY {bet.get('count')} &times; {_esc(str(bet.get('side', '')).upper())} &middot; {_esc(str(bet.get('ticker', '')))} @ {bet.get('price_cents')}c (limit, {_esc(env.upper())})</div>
+<div style="font-size:15px;font-weight:bold;margin-bottom:8px;">{action} {bet.get('count')} &times; {_esc(str(bet.get('side', '')).upper())} &middot; {_esc(str(bet.get('ticker', '')))} @ {bet.get('price_cents')}c (limit, {_esc(env.upper())})</div>
 <div style="color:#94a3b8;">order id: {_esc(str(order_id))}</div>
 <div style="color:#94a3b8;">filled (taker): <b>{filled}</b> of {bet.get('count')} contracts</div>
+{zero_note}
 <div style="color:#38bdf8;margin-top:10px;font-size:15px;">TOTAL FUNDS now: <b>{funds_txt}</b></div>
 </div>
 <div style="color:#64748b;font-size:12px;margin-bottom:14px;">Funds were re-pulled from Kalshi right after this order — the dashboard tile shows the same fresh number.</div>
@@ -1396,8 +1444,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _parse_proposal(self, prompt: str) -> tuple[dict | None, str | None]:
         """Returns (proposal, immediate_message). proposal: ticker/side/count/price_cents/rationale."""
         parsed = webbets.parse_bet_prompt(prompt)
-        if parsed.get("ok") and parsed.get("action") == "buy":
-            return ({"ticker": parsed["ticker"], "side": parsed["side"],
+        if parsed.get("ok") and parsed.get("action") in ("buy", "sell"):
+            return ({"action": parsed["action"], "ticker": parsed["ticker"],
+                     "side": parsed["side"],
                      "count": parsed["count"], "price_cents": parsed["price_cents"],
                      "rationale": "manual order ticket"}, None)
         if parsed.get("ok") and parsed.get("action") == "help":
@@ -1421,9 +1470,16 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             catalog = []
             log.warning("bet: market catalog fetch failed: %s", exc)
-        out = webbets.interpret_with_claude(prompt, catalog=catalog, cfg=cfg)
+        positions = []
+        try:
+            positions = self.dashboard._positions_open(self.dashboard._signed_client())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bet: positions fetch failed (sell grounding skipped): %s", exc)
+        out = webbets.interpret_with_claude(prompt, catalog=catalog, positions=positions,
+                                            cfg=cfg)
         if out.get("action") == "propose":
-            return ({"ticker": out["ticker"], "side": out["side"], "count": out["count"],
+            return ({"action": out.get("order_side", "buy"),
+                     "ticker": out["ticker"], "side": out["side"], "count": out["count"],
                      "price_cents": out.get("price_cents"),
                      "rationale": out.get("rationale", "")}, None)
         return (None, out.get("message") or "couldn't turn that into a bet")
@@ -1454,7 +1510,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if immediate:
                     self._html(render_bet_error(immediate, prompt))
                     return
-                staged = dash.stage_buy(**proposal)
+                staged = dash.stage_order(proposal.pop("action", "buy"), **proposal)
                 if not staged.get("ok"):
                     bet = staged.get("bet") or {}
                     if bet.get("checks"):            # risk-cap failure: show the checklist

@@ -14,7 +14,10 @@ Design rules — the live agent's standards are kept exactly where they are:
 * The model's edge gate (8c) is NOT applied — a manual discretionary bet is
   not a model bet. Everything else (size, price band, exposure, reserve,
   halt) stays where config-live.yaml puts it.
-* Buys only — no selling/closing from the web yet. Everything is logged.
+* Buys, and sells that CLOSE existing positions (never shorts). Everything is logged.
+* Sells are validated against the exchange's own position (signed position_fp;
+  positive = YES contracts, negative = NO). Exits are permitted even under a
+  risk halt — a halt stops new bets, not de-risking.
 
 Natural language:
     If ANTHROPIC_API_KEY is set, free text is interpreted by Claude into a
@@ -40,16 +43,18 @@ LIVE_CFG_PATH = os.environ.get("KALSHI_LIVE_CONFIG", "config-live.yaml")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
 _ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 
-_BUY_RE = re.compile(
-    r"^buy\s+(\d{1,4})\s+(yes|no)\s+([A-Za-z0-9][A-Za-z0-9\-_]{2,63})"
+_ORDER_RE = re.compile(
+    r"^(buy|sell)\s+(\d{1,4})\s+(yes|no)\s+([A-Za-z0-9][A-Za-z0-9\-_]{2,63})"
     r"(?:\s*(?:at|@)?\s*(\d{1,2})c?)?\s*$",
     re.IGNORECASE,
 )
+_BUY_RE = _ORDER_RE  # backwards-compatible alias
 _TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-_]{1,63}$")
 
-_HELP = ("format: buy <n> <yes|no> <TICKER> [at <price>c]  ·  e.g. "
-         "buy 1 yes KXNBAGAME-26NOV25-ABC 42c   (price optional — then best ask is used)\n"
-         "or plain English, e.g. \"put a buck on the Chiefs to win tonight\"\n"
+_HELP = ("format: buy <n> <yes|no> <TICKER> [at <price>c]  ·  or  sell <n> <yes|no> <TICKER> [at <price>c]\n"
+         "e.g. buy 1 yes KXNBAGAME-26NOV25-ABC 42c   (price optional — buy: best ask, sell: best bid)\n"
+         "or plain English, e.g. \"put a buck on the Chiefs to win tonight\"  ·  \"close out my Chiefs bet\"\n"
+         "sells only close what you hold — the box will not short\n"
          "other commands: funds  ·  help")
 
 
@@ -62,10 +67,10 @@ def parse_bet_prompt(text: str) -> dict[str, Any]:
         return {"ok": True, "action": "funds"}
     if low in ("help", "?", "h"):
         return {"ok": True, "action": "help", "msg": _HELP}
-    m = _BUY_RE.match(low)
+    m = _ORDER_RE.match(low)
     if not m:
         return {"ok": False, "msg": "couldn't parse that — " + _HELP.replace("\n", " ")}
-    count_s, side, ticker, price_s = m.groups()
+    action, count_s, side, ticker, price_s = m.groups()
     count = int(count_s)
     ticker = ticker.upper()
     price = int(price_s) if price_s else None
@@ -75,12 +80,12 @@ def parse_bet_prompt(text: str) -> dict[str, Any]:
         return {"ok": False, "msg": "refusing a count that large from a prompt box"}
     if price is not None and not (1 <= price <= 99):
         return {"ok": False, "msg": "price must be between 1c and 99c"}
-    return {"ok": True, "action": "buy", "count": count, "side": side,
+    return {"ok": True, "action": action, "count": count, "side": side,
             "ticker": ticker, "price_cents": price}
 
 
 def looks_like_ticket(text: str) -> bool:
-    return bool(_BUY_RE.match((text or "").strip().lower()))
+    return bool(_ORDER_RE.match((text or "").strip().lower()))
 
 
 # ------------------------------------------------------------ economics -----
@@ -125,6 +130,89 @@ def open_position_count(positions: list[dict[str, Any]] | None) -> int:
         if abs(_fp(p.get("position_fp") or p.get("position") or 0)) > 0:
             n += 1
     return n
+
+
+def position_side_ticker(p: dict[str, Any]) -> str:
+    return str(p.get("ticker") or p.get("market_ticker") or "")
+
+
+def held_contracts(positions: list[dict[str, Any]] | None, ticker: str, side: str) -> int:
+    """Contracts held of (ticker, side), from exchange position rows.
+
+    Kalshi's position_fp is SIGNED: positive = YES contracts, negative = NO.
+    Explicit per-side fields win if present (defensive).
+    """
+    n = 0
+    for p in positions or []:
+        if position_side_ticker(p) != ticker:
+            continue
+        if side == "yes":
+            for k in ("yes_contracts", "yes_count"):
+                if p.get(k) is not None:
+                    n += int(_fp(p.get(k))); break
+            else:
+                net = _fp(p.get("position_fp") or p.get("position") or 0)
+                if net > 0:
+                    n += int(net)
+        else:
+            for k in ("no_contracts", "no_count"):
+                if p.get(k) is not None:
+                    n += int(_fp(p.get(k))); break
+            else:
+                net = _fp(p.get("position_fp") or p.get("position") or 0)
+                if net < 0:
+                    n += int(-net)
+    return max(0, n)
+
+
+def held_positions_summary(positions: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for p in positions or []:
+        t = position_side_ticker(p)
+        if not t:
+            continue
+        net = _fp(p.get("position_fp") or p.get("position") or 0)
+        if net > 0:
+            out.append({"ticker": t, "side": "yes", "count": int(net)})
+        elif net < 0:
+            out.append({"ticker": t, "side": "no", "count": int(-net)})
+    return out
+
+
+def assess_sell(cfg: AppConfig, *, balance_cents: int, count: int, price_cents: int,
+                ticker: str, side: str, positions: list[dict[str, Any]] | None,
+                halted: bool, halt_reason: str) -> dict[str, Any]:
+    """Checks for a SELL that closes an existing position (never a short)."""
+    fee = estimate_fee_cents(count, price_cents, cfg.taker_fee_multiplier)
+    proceeds = count * price_cents - fee
+    held = held_contracts(positions, ticker, side)
+    checks: list[tuple[str, bool, str]] = []
+
+    ok = 1 <= price_cents <= 99
+    checks.append(("limit price between 1c and 99c", ok, f"{price_cents}c"))
+
+    ok = count <= cfg.max_contracts_per_order
+    checks.append((f"≤ {cfg.max_contracts_per_order} contracts per order", ok, f"selling {count}"))
+
+    ok = count <= held
+    checks.append((f"closing only what you hold ({held} {side.upper()} of {ticker})", ok,
+                   f"selling {count}"))
+
+    checks.append(("risk halt check — exits always permitted", True,
+                   (halt_reason + " (halt blocks NEW bets, not exits)" if halted
+                    else "no halt")))
+
+    checks.append(("cash effect of this sale", True,
+                   f"+{proceeds}c after est. fee of {fee}c"))
+
+    return {
+        "fee_cents": fee,
+        "order_cost_cents": -proceeds,          # negative = cash IN
+        "proceeds_cents": proceeds,
+        "held": held,
+        "checks": checks,
+        "ok": all(ok for _, ok, _ in checks),
+    }
 
 
 def find_halt(obj: Any) -> tuple[bool, str]:
@@ -249,11 +337,13 @@ def market_catalog(client: Any, series_list: list[str], per_series: int = 25,
 
 _LLM_SYSTEM = """You translate a user's request into ONE Kalshi order proposal, or explain why not.
 Rules, in priority order:
-1. You may ONLY name tickers from the OPEN MARKETS list provided in the user message. Never invent tickers.
-2. Only BUY orders, side yes or no, 1-{max_contracts} contracts. A "yes" buy pays off if the event happens; "no" pays if it doesn't.
-3. If the request doesn't map to a real open market, or is too vague, action must be "none" with a short, specific message naming what IS tradable.
-4. price_cents: integer 1-99, or null to take the current best ask. Prefer null unless the user named a price.
-5. Reply with ONLY compact JSON: {{"action":"propose","ticker":"...","side":"yes"|"no","count":N,"price_cents":null|N,"rationale":"one short sentence"}} or {{"action":"none","message":"..."}}
+1. You may ONLY name tickers from the OPEN MARKETS list (for buys) or the OPEN POSITIONS list (for sells) provided in the user message. Never invent tickers.
+2. order_side is "buy" or "sell". A sell CLOSES an existing position — you may only sell tickers in OPEN POSITIONS, in the side held, in a count <= held. Never propose a short.
+3. A "yes" buy pays off if the event happens; a "no" buy pays if it doesn't. Selling YES/NO closes that leg.
+4. Size is 1-{max_contracts} contracts.
+5. If the request doesn't map to a real open market / held position, or is too vague, action must be "none" with a short, specific message naming what IS available.
+6. price_cents: integer 1-99, or null to take the current best ask (buys) / best bid (sells). Prefer null unless the user named a price.
+7. Reply with ONLY compact JSON: {{"action":"propose","order_side":"buy"|"sell","ticker":"...","side":"yes"|"no","count":N,"price_cents":null|N,"rationale":"one short sentence"}} or {{"action":"none","message":"..."}}
 Do not add commentary outside the JSON."""
 
 
@@ -269,7 +359,13 @@ def parse_llm_json(text: str) -> dict[str, Any] | None:
 
 
 
+def positions_catalog(held: list[dict[str, Any]]) -> str:
+    lines = [f"{h['ticker']} | {h['side']} | holding {h['count']}" for h in held]
+    return "\n".join(lines) if lines else "(no open positions)"
+
+
 def interpret_with_claude(prompt: str, *, catalog: list[dict[str, str]],
+                          positions: list[dict[str, Any]] | None = None,
                           cfg: AppConfig,
                           api_key: str | None = None,
                           session: Any = None) -> dict[str, Any]:
@@ -281,8 +377,11 @@ def interpret_with_claude(prompt: str, *, catalog: list[dict[str, str]],
                            "add it with: fly secrets set ANTHROPIC_API_KEY=... "
                            "(or use ticket syntax: buy 1 yes TICKER @ 42c)"}
     markets_txt = "\n".join(f"{m['ticker']} | {m['title']}" for m in catalog) or "(no open markets found in watchlist series)"
+    held = held_positions_summary(positions)
+    positions_txt = positions_catalog(held)
     sys_p = _LLM_SYSTEM.format(max_contracts=cfg.max_contracts_per_order)
-    user_msg = (f"USER REQUEST:\n{prompt}\n\nOPEN MARKETS:\n{markets_txt}\n")
+    user_msg = (f"USER REQUEST:\n{prompt}\n\nOPEN MARKETS:\n{markets_txt}\n\nOPEN POSITIONS:\n{positions_txt}\n")
+    held_map = {(h["ticker"], h["side"]): h["count"] for h in held}
     http = session or requests
     try:
         resp = http.post(_ANTHROPIC_URL, timeout=45, headers={
@@ -314,6 +413,9 @@ def interpret_with_claude(prompt: str, *, catalog: list[dict[str, str]],
         return {"action": "none", "message": "model didn't return JSON — try ticket syntax"}
     if obj.get("action") != "propose":
         return {"action": "none", "message": str(obj.get("message") or "not a bettable request")}
+    order_side = str(obj.get("order_side") or obj.get("direction") or "buy").lower()
+    if order_side not in ("buy", "sell"):
+        return {"action": "none", "message": "model proposed an invalid order_side — rejected"}
     side = str(obj.get("side") or "").lower()
     ticker = str(obj.get("ticker") or "").upper().strip()
     try:
@@ -325,13 +427,22 @@ def interpret_with_claude(prompt: str, *, catalog: list[dict[str, str]],
         price = int(price) if price is not None else None
     except (TypeError, ValueError):
         price = None
-    known = {m["ticker"] for m in catalog}
-    if ticker not in known or not _TICKER_RE.match(ticker):
-        return {"action": "none",
-                "message": f"model proposed an unknown/untradable ticker {ticker!r} — rejected"}
+    if not _TICKER_RE.match(ticker):
+        return {"action": "none", "message": "model proposed a malformed ticker — rejected"}
     if side not in ("yes", "no"):
         return {"action": "none", "message": "model proposed an invalid side — rejected"}
     count = max(1, min(count, cfg.max_contracts_per_order))
     rationale = str(obj.get("rationale") or "")[:200]
-    return {"action": "propose", "ticker": ticker, "side": side, "count": count,
-            "price_cents": price, "rationale": rationale}
+    if order_side == "sell":
+        held_n = held_map.get((ticker, side), 0)
+        if held_n <= 0:
+            return {"action": "none",
+                    "message": f"you don't hold any {side.upper()} in {ticker} — nothing to sell"}
+        count = min(count, held_n)
+    else:
+        known = {m["ticker"] for m in catalog}
+        if ticker not in known:
+            return {"action": "none",
+                    "message": f"model proposed an unknown/untradable ticker {ticker!r} — rejected"}
+    return {"action": "propose", "order_side": order_side, "ticker": ticker, "side": side,
+            "count": count, "price_cents": price, "rationale": rationale}

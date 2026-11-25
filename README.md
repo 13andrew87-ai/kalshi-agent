@@ -57,7 +57,10 @@ The dashboard also has a manual bet box (top of page), for discretionary bets:
   against fresh exchange state (contracts per order, price band, cash reserve,
   open-position limit, per-market and total exposure, risk halt). Confirm is
   single-use, expires after 2 minutes, and re-validates everything at send time.
-- **Buys only, IOC limit orders, fee-aware.** Your `config-live.yaml` standards are
+- **Buys and sells that close existing positions — never shorts.** Selling is validated
+  against the exchange's own position (signed `position_fp`), IOC limit, fee-aware; exits
+  are permitted even under a risk halt (a halt stops new bets, not de-risking).
+  Your `config-live.yaml` standards are
   exactly where they were — the 8¢ model edge gate is *not* applied to discretionary
   manual bets (it measures the model, not you); every other standard is enforced.
 - Set `ANTHROPIC_API_KEY` (and optionally `ANTHROPIC_MODEL`) via `fly secrets set` —
