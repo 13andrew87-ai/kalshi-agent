@@ -20,10 +20,11 @@ Design rules — the live agent's standards are kept exactly where they are:
   risk halt — a halt stops new bets, not de-risking.
 
 Natural language:
-    If ANTHROPIC_API_KEY is set, free text is interpreted by Claude into a
+    If an AI key is configured (see llm.py — Groq/Gemini free tiers work),
+    free text is interpreted into a
     structured bet proposal, grounded on the live list of open markets in the
     watchlist series (so it can only name real, currently-tradable tickers).
-    Without the key, only the deterministic ticket syntax works.
+    Without one, only the deterministic ticket syntax works.
 """
 from __future__ import annotations
 
@@ -35,13 +36,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-import requests
-
+from . import llm as _llm
 from .config import AppConfig
 
 LIVE_CFG_PATH = os.environ.get("KALSHI_LIVE_CONFIG", "config-live.yaml")
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
-_ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")  # retained for back-compat
 
 _ORDER_RE = re.compile(
     r"^(buy|sell)\s+(\d{1,4})\s+(yes|no)\s+([A-Za-z0-9][A-Za-z0-9\-_]{2,63})"
@@ -369,45 +368,25 @@ def interpret_with_claude(prompt: str, *, catalog: list[dict[str, str]],
                           cfg: AppConfig,
                           api_key: str | None = None,
                           session: Any = None) -> dict[str, Any]:
-    """LLM path: free text -> structured proposal. Never places an order."""
-    key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
+    """AI path: free text -> structured proposal (any configured provider). Never places an order."""
+    client = _llm.LLMClient(session=session, api_key=api_key)
+    if not client.configured:
         return {"action": "none",
-                "message": "natural language needs ANTHROPIC_API_KEY on the server — "
-                           "add it with: fly secrets set ANTHROPIC_API_KEY=... "
-                           "(or use ticket syntax: buy 1 yes TICKER @ 42c)"}
+                "message": "natural language needs an AI key on the server — add a FREE one: "
+                           "fly secrets set GROQ_API_KEY=... (console.groq.com, free, no card) "
+                           "or GEMINI_API_KEY=... (aistudio.google.com, free) — "
+                           "or use ticket syntax: buy 1 yes TICKER @ 42c"}
     markets_txt = "\n".join(f"{m['ticker']} | {m['title']}" for m in catalog) or "(no open markets found in watchlist series)"
     held = held_positions_summary(positions)
     positions_txt = positions_catalog(held)
     sys_p = _LLM_SYSTEM.format(max_contracts=cfg.max_contracts_per_order)
     user_msg = (f"USER REQUEST:\n{prompt}\n\nOPEN MARKETS:\n{markets_txt}\n\nOPEN POSITIONS:\n{positions_txt}\n")
     held_map = {(h["ticker"], h["side"]): h["count"] for h in held}
-    http = session or requests
-    try:
-        resp = http.post(_ANTHROPIC_URL, timeout=45, headers={
-            "x-api-key": key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }, json={
-            "model": ANTHROPIC_MODEL,
-            "max_tokens": 400,
-            "system": sys_p,
-            "messages": [{"role": "user", "content": user_msg}],
-        })
-    except Exception as exc:  # noqa: BLE001
-        return {"action": "none", "message": f"couldn't reach Anthropic: {exc}"}
-    if resp.status_code != 200:
-        detail = ""
-        try:
-            detail = resp.json().get("error", {}).get("message", "")
-        except Exception:  # noqa: BLE001
-            detail = resp.text[:200]
+    text = client.complete(system=sys_p, user=user_msg, max_tokens=400)
+    if text is None:
         return {"action": "none",
-                "message": f"Anthropic error {resp.status_code}: {detail}"}
-    try:
-        text = resp.json()["content"][0]["text"]
-    except Exception:  # noqa: BLE001
-        return {"action": "none", "message": "unexpected Anthropic response shape"}
+                "message": f"{client.provider} AI call failed (no credits / outage?) — "
+                           f"ticket syntax always works: buy 1 yes TICKER @ 42c"}
     obj = parse_llm_json(text)
     if not obj:
         return {"action": "none", "message": "model didn't return JSON — try ticket syntax"}

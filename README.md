@@ -55,9 +55,14 @@ The dashboard also has a manual bet box (top of page), for discretionary bets:
 - **Total funds** tile shows your **signed Kalshi exchange balance** (auto-refreshed
   every 5s and re-pulled immediately after any bet is placed).
 - Type a ticket — `buy 2 yes KXNFLGAME-26NOV25-KC at 25c` (price optional; falls back
-  to the best ask) — or plain English; with `ANTHROPIC_API_KEY` set on the server,
-  Claude Haiku interprets the request and may only name real, currently-open markets
-  from the watchlist series. Without the key, ticket syntax still works.
+  to the best ask) — or plain English. With any LLM key set on the server, the agent
+  interprets the request and may only name real, currently-open markets from the
+  watchlist series (sells only what you hold — never shorts). Without a key, ticket
+  syntax still works.
+  **Free options** (no credit card): `GROQ_API_KEY` (https://console.groq.com/keys —
+  Llama 3.3 70B) or `GEMINI_API_KEY` (https://aistudio.google.com/apikey — Gemini 2.5
+  Flash). Also supported: Cerebras, OpenRouter free models, Mistral, OpenAI, Anthropic.
+  Detection order is automatic; force with `LLM_PROVIDER`.
 - **Nothing is sent automatically — and the confirmation happens right inside the box.**
   Type your bet, the box replies with the full order summary (side, size, limit, IOC,
   fees, total cost, balance after, and caps re-checked against fresh exchange state —
@@ -71,9 +76,10 @@ The dashboard also has a manual bet box (top of page), for discretionary bets:
   Your `config-live.yaml` standards are
   exactly where they were — the 8¢ model edge gate is *not* applied to discretionary
   manual bets (it measures the model, not you); every other standard is enforced.
-- Set `ANTHROPIC_API_KEY` (and optionally `ANTHROPIC_MODEL`) via `fly secrets set` —
-  never commit it. `ANTHROPIC_API_KEY` is the only new secret; without it the
-  natural-language path is disabled and the UI says so.
+- Set ONE of the LLM keys listed above (or `LLM_API_KEY` + `LLM_BASE_URL` for any
+  OpenAI-compatible endpoint) via `fly secrets set` — never commit it. Without one the
+  plain-English path is disabled and ticket syntax (and the local agent's exit
+  fallback rules) keep working.
 
 The demo spins up 18 synthetic markets whose hidden true probabilities evolve as
 mean-reverting random walks, quotes imperfect books around them, and runs the
@@ -123,9 +129,10 @@ get out.** They still require the engine not be halted and the ticker allowed.
 
 ### AI-managed exits (opt-in; `ai_exits_enabled`, on in `config-live.yaml`)
 
-The local live bot can hand the *judgment* call to Claude (Haiku 4.5): whether
-to finally realize a profit, let it run, or cut a loser early — while the
-machine-enforced standards stay exactly where they are:
+The local live bot can hand the *judgment* call to any configured AI model
+(free Groq/Gemini keys work; provider auto-detected — see `kalshi_agent/llm.py`):
+whether to finally realize a profit, let it run, or cut a loser early — while
+the machine-enforced standards stay exactly where they are:
 
 - **The 15¢ cents stop is absolute.** If pnl ≤ −15¢ the position is sold before
   the model is ever consulted — a hard floor in code, not a prompt.
@@ -138,8 +145,8 @@ machine-enforced standards stay exactly where they are:
   fixed exit (e.g. take-profit at +5¢) but can never suppress the hard floor;
   `low` confidence defers to the fixed rules entirely.
 - Every decision is logged with its rationale (`kalshi.ai_exits`).
-- Cost: one Claude Haiku call per position per poll — trivially cheap, and zero
-  when there is no position open. Requires a funded ANTHROPIC_API_KEY.
+- Cost: one (small) LLM call per position per poll — trivially cheap, and zero
+  when there is no position open. Works with FREE provider keys (see above).
 - Entries are unchanged: still only on the model's 8¢ edge, sized by Kelly,
   through the same risk gate.
 

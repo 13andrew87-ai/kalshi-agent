@@ -27,28 +27,24 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import time
 from typing import Any
 
-import requests
-
+from . import llm as _llm
 from .models import Intent
 
 log = logging.getLogger("kalshi.ai_exits")
 
-_ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 _HARD_PREFIXES = ("STOP",)          # rationales produced by the strategy's hard stop
-_KEEP_ONLY = ("AI-EXIT",)         # our own rationale prefix; pass through untouched
 
 
 class AIExitAdvisor:
     def __init__(self, cfg, api_key: str | None = None, session: Any = None,
                  model: str | None = None, min_interval_minutes: float | None = None):
         self.cfg = cfg
-        self.key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY")
-        self.model = model or os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
+        self._api_key = api_key          # explicit key honored (back-compat; else env auto-detect)
+        self._model = model
         self.session = session   # injectable for tests
         mins = min_interval_minutes
         if mins is None:
@@ -87,13 +83,15 @@ class AIExitAdvisor:
         if now - last < self.min_interval_s:
             return intent
 
-        # 4) no key -> deterministic old behavior, loudly
-        if not self.key:
-            log.warning("AI exits enabled but ANTHROPIC_API_KEY is unset — fixed exits for %s", ticker)
+        client = self._client()
+        if not client.configured:
+            log.warning("AI exits enabled but no AI key configured (set GROQ_API_KEY free at "
+                        "console.groq.com or GEMINI_API_KEY free at aistudio.google.com) — "
+                        "fixed exits for %s", ticker)
             self._last_call[ticker] = now
             return intent
 
-        verdict = self._ask(market=market, held_side=held_side, qty=qty,
+        verdict = self._ask(client, market=market, held_side=held_side, qty=qty,
                             entry=entry, mark=mark, pnl=pnl,
                             prediction=prediction, intent=intent)
         self._last_call[ticker] = now
@@ -118,7 +116,14 @@ class AIExitAdvisor:
         return None
 
     # -------------------------------------------------------------- inner ---
-    def _ask(self, *, market, held_side, qty, entry, mark, pnl,
+    def _client(self):
+        return _llm.LLMClient(session=self.session, api_key=self._api_key,
+                              model=self._model)
+
+    def describe(self) -> str:
+        return self._client().describe()
+
+    def _ask(self, client, *, market, held_side, qty, entry, mark, pnl,
              prediction, intent) -> dict[str, Any] | None:
         p_yes = getattr(prediction, "p_blend", None)
         if p_yes is None:
@@ -153,32 +158,11 @@ class AIExitAdvisor:
         system = ("You are a disciplined trading desk exiting one position at a time. "
                   "You never recommend adding risk, only holding or selling. "
                   "No advice, no hedging prose — just the JSON.")
-        http = self.session or requests
-        try:
-            resp = http.post(_ANTHROPIC_URL, timeout=45, headers={
-                "x-api-key": self.key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            }, json={
-                "model": self.model,
-                "max_tokens": 200,
-                "system": system,
-                "messages": [{"role": "user", "content": user_msg}],
-            })
-        except Exception as exc:  # noqa: BLE001
-            log.error("AI exit call failed for %s (%s) — fixed rules apply", market.ticker, exc)
-            return None
-        if resp.status_code != 200:
-            detail = ""
-            try:
-                detail = resp.json().get("error", {}).get("message", "")
-            except Exception:  # noqa: BLE001
-                detail = (resp.text or "")[:200]
-            log.error("AI exit HTTP %s for %s: %s — fixed rules apply",
-                      resp.status_code, market.ticker, detail)
+        text = client.complete(system=system, user=user_msg, max_tokens=200)
+        if text is None:
+            log.error("AI exit call failed for %s — fixed rules apply", market.ticker)
             return None
         try:
-            text = resp.json()["content"][0]["text"]
             m = re.search(r"\{.*\}", text, re.DOTALL)
             obj = json.loads(m.group(0)) if m else None
         except Exception:  # noqa: BLE001

@@ -1233,7 +1233,8 @@ def _bet_panel(dash: "WebDashboard", funds: dict, base: str) -> str:
             f'<a href="{base}/credentials" style="color:#93c5fd;">API keys &amp; credentials</a></div>')
     env = cred.get("env") or "live"
     label, accent = _env_label(env)
-    llm = "Claude connected" if os.environ.get("ANTHROPIC_API_KEY") else "ticket syntax only (no ANTHROPIC_API_KEY on server)"
+    from . import llm as _llm
+    llm = _llm.get_client().describe() + ("" if _llm.get_client().configured else " — ticket syntax works")
     cfg_note = "config-live.yaml caps loaded" if dash._live_cfg_ok else "config-live.yaml NOT found — falling back to built-in defaults"
     caps = (f"max {dash._live_cfg.max_contracts_per_order} contracts/order · price band "
             f"{dash._live_cfg.min_price_cents}–{dash._live_cfg.max_price_cents}c · "
@@ -1331,8 +1332,10 @@ def render_account_page(dash: "WebDashboard") -> str:
                'paste your private PEM → pick env (demo first!) → Save &amp; test. Your PEM goes '
                'straight from this browser to the server over TLS.</div>')
 
-    llm_note = ("Claude connected for plain-English bets" if os.environ.get("ANTHROPIC_API_KEY")
-                else "ticket syntax only (no ANTHROPIC_API_KEY on server)")
+    from . import llm as _llm
+    _c = _llm.get_client()
+    llm_note = (f"{_c.describe()} for plain-English bets" if _c.configured
+                else "ticket syntax only (no AI key on server — add free GROQ_API_KEY or GEMINI_API_KEY)")
     caps = (f"max {dash._live_cfg.max_contracts_per_order} contracts/order · entries "
             f"{dash._live_cfg.min_price_cents}–{dash._live_cfg.max_price_cents}c · "
             "IOC limit · fee-aware · buys + closing sells (never shorts) · exits allowed under halt · "

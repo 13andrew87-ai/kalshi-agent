@@ -52,11 +52,40 @@ def test_llm_json_extraction():
 
 
 def test_interpret_without_key_returns_clear_message(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    for k in ("ANTHROPIC_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+              "CEREBRAS_API_KEY", "OPENROUTER_API_KEY", "MISTRAL_API_KEY", "OPENAI_API_KEY",
+              "LLM_API_KEY", "LLM_PROVIDER"):
+        monkeypatch.delenv(k, raising=False)
     cfg = AppConfig()
     out = webbets.interpret_with_claude("put a buck on the chiefs", catalog=[], cfg=cfg, api_key=None)
     assert out["action"] == "none"
-    assert "ANTHROPIC_API_KEY" in out["message"]
+    assert "GROQ_API_KEY" in out["message"]
+
+
+def test_interpret_free_groq_provider_openai_shape(monkeypatch):
+    """Groq (free tier) speaks OpenAI shape — verify auto-detection + parsing."""
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test_key")
+    for k in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "LLM_PROVIDER", "LLM_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    cfg = AppConfig()
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"action":"propose","order_side":"buy","ticker":"KXNFLGAME-REAL","side":"yes","count":1,"price_cents":null,"rationale":"free ai"}'}}]}
+
+    class _Sess:
+        def post(self, url, **kw):
+            assert kw["headers"]["Authorization"] == "Bearer gsk_test_key"
+            assert "groq" in url
+            return _Resp()
+
+    out = webbets.interpret_with_claude("put a buck on the chiefs",
+                                        catalog=[{"ticker": "KXNFLGAME-REAL", "title": "Chiefs ML"}],
+                                        cfg=cfg, api_key=None, session=_Sess())
+    assert out["action"] == "propose" and out["ticker"] == "KXNFLGAME-REAL"
 
 
 def test_interpret_rejects_hallucinated_ticker(monkeypatch):

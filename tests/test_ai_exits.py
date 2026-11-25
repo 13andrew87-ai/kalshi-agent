@@ -172,10 +172,13 @@ def test_rate_limit_skips_llm_between_checks():
     assert sess.calls == 1
 
 
-def test_no_api_key_falls_back_loudly():
+def test_no_api_key_falls_back_loudly(monkeypatch):
+    for k in ("ANTHROPIC_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+              "CEREBRAS_API_KEY", "OPENROUTER_API_KEY", "MISTRAL_API_KEY", "OPENAI_API_KEY",
+              "LLM_API_KEY", "LLM_PROVIDER"):
+        monkeypatch.delenv(k, raising=False)
     cfg = _cfg()
     adv = AIExitAdvisor(cfg, api_key=None, session=FakeSession(), min_interval_minutes=0.001)
-    adv.key = None
     tp = _strategy_intent(cfg)
     out = adv.decide(market=FakeMarket(), book=FakeBook(bid_yes=45),
                      prediction=FakePrediction(), intent=tp,

@@ -76,9 +76,9 @@ class Agent:
             try:
                 from .ai_exits import AIExitAdvisor
                 self.ai_exits = AIExitAdvisor(cfg)
-                log.warning("AI-MANAGED EXITS ENABLED (model=%s, one call/position/%sm). "
+                log.warning("AI-MANAGED EXITS ENABLED (%s, one call/position/%sm). "
                             "Hard stop at -%sc is untouchable.",
-                            self.ai_exits.model, getattr(cfg, "ai_exit_poll_minutes", 5),
+                            self.ai_exits.describe(), getattr(cfg, "ai_exit_poll_minutes", 5),
                             getattr(cfg, "stop_loss_cents", 0))
             except Exception:  # noqa: BLE001
                 log.exception("AI exit advisor failed to initialize — fixed exits will run")
