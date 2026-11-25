@@ -12,14 +12,17 @@ primary_region = "lax"   # Los Angeles — nearest Fly region to Phoenix, AZ (ph
 
 [env]
   PORT = "8080"
-  KALSHI_PRIVATE_KEY_PATH = "/app/state/credentials/kalshi_private_key.pem"
+  # KALSHI_PRIVATE_KEY_PATH carries no secret value but Fly heuristics flag
+  # the name; it lives in `fly secrets` instead (set 2026-11-25)."
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = false   # keep the trading agent alive; do NOT scale to zero
-  auto_start_machines = true
-  min_machines_running = 1
+  auto_stop_machines = "stop"    # sleep when idle (user request 2026-11-25) —
+                                 # the PAPER/sim agent pauses while asleep;
+                                 # live money is NOT on Fly, it lives in the sandbox
+  auto_start_machines = true     # wakes on the next HTTP request
+  min_machines_running = 0
 
 [[http_service.checks]]
   interval = "30s"

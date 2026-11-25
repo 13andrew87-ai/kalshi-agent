@@ -181,3 +181,19 @@ def test_path_token_stable_and_secret():
     assert _path_token() == _path_token()
     assert len(_path_token()) == 32
     assert _path_token() != "unit-test-gate-password-9f3a"
+
+
+def test_security_headers_present(server):
+    port, _ = server
+    status, headers, _ = req(port, "GET", "/")
+    assert headers.get("X-Content-Type-Options") == "nosniff"
+    assert headers.get("Strict-Transport-Security") == "max-age=63072000"
+    assert headers.get("X-Frame-Options") == "DENY"
+    assert headers.get("Referrer-Policy") == "no-referrer"
+
+
+def test_session_cookie_is_httponly_samesite(server):
+    port, _ = server
+    status, headers, _ = req(port, "POST", "/login", b"password=unit-test-gate-password-9f3a")
+    sc = headers.get("Set-Cookie", "")
+    assert "HttpOnly" in sc and "SameSite=Lax" in sc
