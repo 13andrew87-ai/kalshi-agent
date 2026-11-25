@@ -6,7 +6,7 @@
 # 5. fly deploy
 
 app = "kalshi-agent"
-primary_region = "phx"   # Phoenix (user is in Phoenix, AZ) — change if unavailable
+primary_region = "lax"   # Los Angeles — nearest Fly region to Phoenix, AZ (phx does not exist)
 
 [build]
 
