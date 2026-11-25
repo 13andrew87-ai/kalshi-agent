@@ -121,6 +121,28 @@ identical code path used live. Every fill, exit, block, and settlement is logged
 Exits (sells) bypass the exposure caps by design — **you must always be able to
 get out.** They still require the engine not be halted and the ticker allowed.
 
+### AI-managed exits (opt-in; `ai_exits_enabled`, on in `config-live.yaml`)
+
+The local live bot can hand the *judgment* call to Claude (Haiku 4.5): whether
+to finally realize a profit, let it run, or cut a loser early — while the
+machine-enforced standards stay exactly where they are:
+
+- **The 15¢ cents stop is absolute.** If pnl ≤ −15¢ the position is sold before
+  the model is ever consulted — a hard floor in code, not a prompt.
+- **Failure degrades to the old rules.** No key, empty credits, outage, or
+  garbage output → the validated fixed exits run (+5¢ take-profit / reversal /
+  time-exit) exactly as before.
+- One advisor call per position per `ai_exit_poll_minutes` (default 5); between
+  checks the fixed rules govern, so an outage can't strand a position.
+- Medium/high-confidence `sell` → sold; `hold` suppresses a *discretionary*
+  fixed exit (e.g. take-profit at +5¢) but can never suppress the hard floor;
+  `low` confidence defers to the fixed rules entirely.
+- Every decision is logged with its rationale (`kalshi.ai_exits`).
+- Cost: one Claude Haiku call per position per poll — trivially cheap, and zero
+  when there is no position open. Requires a funded ANTHROPIC_API_KEY.
+- Entries are unchanged: still only on the model's 8¢ edge, sized by Kelly,
+  through the same risk gate.
+
 ## Going live — the gates
 
 Live trading requires **all** of these, in order:

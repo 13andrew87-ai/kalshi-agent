@@ -22,8 +22,13 @@ min_price_cents: 8
 order_type: ioc
 stop_loss_pct: 0.0              # %-of-stake exits disabled — cents rule won the backtest sweep
 take_profit_pct: 0.0            # (15c stop / +5c take-profit, best of 16 combos x 3 seeds)
-stop_loss_cents: 15             # sell at 15c below entry
-take_profit_cents: 5            # sell at 5c above entry (validated)
+stop_loss_cents: 15             # sell at 15c below entry — UNTOUCHABLE hard floor, AI cannot override
+take_profit_cents: 5            # fixed fallback if AI is unavailable (credits/outage/garbage)
+# --- AI-managed exits (user request 2026-11-25): Claude decides when profits are
+# --- maxed / when to cut a loser early. Any failure degrades to the fixed rules
+# --- above. Hard floor is enforced in code before the LLM is ever consulted.
+ai_exits_enabled: true
+ai_exit_poll_minutes: 5
 cooldown_minutes_after_loss: 60
 consecutive_loss_kill: 6
 categories: []

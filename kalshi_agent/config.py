@@ -52,6 +52,11 @@ class AppConfig:
     take_profit_pct: float = 0.0             # %-of-stake take-profit (0 = disabled)
     stop_loss_cents: int = 15                # exit if mark falls >= this many cents below entry
     take_profit_cents: int = 5               # exit if mark rises >= this many cents above entry
+    # AI-managed exit overlay (opt-in). Claude judges when a profitable run is
+    # over or a loser should be cut early; the cents stop above stays an
+    # untouchable hard floor. Any AI failure degrades to the fixed rules.
+    ai_exits_enabled: bool = False           # config-live.yaml turns this on for the local live bot
+    ai_exit_poll_minutes: int = 5            # max advisor calls per position per N minutes
     max_close_hours_ahead: int = 24 * 21      # only trade markets closing within this window
     min_hours_to_close: float = 1.0           # don't trade markets about to close
     cooldown_minutes_after_loss: int = 60     # per-market cooldown after a losing entry

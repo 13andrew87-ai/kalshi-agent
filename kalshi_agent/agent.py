@@ -70,6 +70,18 @@ class Agent:
         self.predictor = predictor or Predictor(cfg, BaseRateTable.from_yaml(cfg.base_rates_path))
         self.start_of_day_equity = start_of_day_equity or portfolio.starting_cash_cents
         self.last_marks: dict[str, int] = {}
+        # AI-managed exits (opt-in per config; hard floor enforced in the advisor)
+        self.ai_exits = None
+        if getattr(cfg, "ai_exits_enabled", False):
+            try:
+                from .ai_exits import AIExitAdvisor
+                self.ai_exits = AIExitAdvisor(cfg)
+                log.warning("AI-MANAGED EXITS ENABLED (model=%s, one call/position/%sm). "
+                            "Hard stop at -%sc is untouchable.",
+                            self.ai_exits.model, getattr(cfg, "ai_exit_poll_minutes", 5),
+                            getattr(cfg, "stop_loss_cents", 0))
+            except Exception:  # noqa: BLE001
+                log.exception("AI exit advisor failed to initialize — fixed exits will run")
 
     # ------------------------------------------------------------ helpers ---
     def _candidate_markets(self) -> list[Market]:
@@ -228,6 +240,12 @@ class Agent:
             exit_intent = self.strategy.evaluate_exit(
                 m, book, pred, pos.yes_count, pos.no_count, avg_price
             )
+            if self.ai_exits is not None:
+                exit_intent = self.ai_exits.decide(
+                    market=m, book=book, prediction=pred, intent=exit_intent,
+                    position_yes=pos.yes_count, position_no=pos.no_count,
+                    avg_price_cents=avg_price,
+                )
             if exit_intent is None:
                 continue
             ok, why = self.risk.pre_trade_check(

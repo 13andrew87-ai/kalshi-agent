@@ -32,7 +32,9 @@ consecutive_loss_kill: 6
 min_cash_reserve_pct: 20.0
 stop_loss_pct: 0.0              # %-of-stake exits disabled — cents rule won the backtest sweep
 take_profit_pct: 0.0            # (15c stop / +5c take-profit, best of 16 combos x 3 seeds)
-stop_loss_cents: 15             # sell at 15c below entry
+stop_loss_cents: 15
+# ai_exits_enabled: false   # opt-in: Claude manages exits (fixed rules are fallback; hard stop always enforced)
+# ai_exit_poll_minutes: 5             # sell at 15c below entry
 take_profit_cents: 5            # sell at 5c above entry (validated)
 max_close_hours_ahead: 504                  # 21 days
 min_hours_to_close: 1.0
