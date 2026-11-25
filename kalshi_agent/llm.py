@@ -2,7 +2,7 @@
 
 Pick a provider by setting ONE env key — no code change, no billing wall:
 
-  GROQ_API_KEY        Groq cloud (FREE tier) — default model llama-3.3-70b-versatile
+  GROQ_API_KEY        Groq cloud (FREE tier) — default model openai/gpt-oss-120b
   GEMINI_API_KEY      Google AI Studio (FREE tier) — default model gemini-2.5-flash
                       (GOOGLE_API_KEY also accepted)
   CEREBRAS_API_KEY    Cerebras (FREE tier) — default model llama-3.3-70b
@@ -33,7 +33,7 @@ log = logging.getLogger("kalshi.llm")
 _PROVIDERS: dict[str, dict[str, str]] = {
     "groq": {
         "url": "https://api.groq.com/openai/v1/chat/completions",
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-120b",
         "key_env": "GROQ_API_KEY",
     },
     "gemini": {
