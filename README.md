@@ -39,8 +39,30 @@ open reports/status.html
 ```
 
 `web --mode paper` runs the same dashboard agent against **real Kalshi market
-data** (public endpoints, paper fills). Real-money live trading intentionally has
-no web control — it stays behind the CLI gates described below.
+data** (public endpoints, paper fills). The autonomous agent never gets web-based
+real-money control — it stays behind the CLI gates described below.
+
+### The "Ask to place a bet" prompt box
+
+The dashboard also has a manual bet box (top of page), for discretionary bets:
+
+- **Total funds** tile shows your **signed Kalshi exchange balance** (auto-refreshed
+  every 5s and re-pulled immediately after any bet is placed).
+- Type a ticket — `buy 2 yes KXNFLGAME-26NOV25-KC at 25c` (price optional; falls back
+  to the best ask) — or plain English; with `ANTHROPIC_API_KEY` set on the server,
+  Claude Haiku interprets the request and may only name real, currently-open markets
+  from the watchlist series. Without the key, ticket syntax still works.
+- **Nothing is sent automatically.** You get a confirmation page with the exact order,
+  fees, balance-before/after, and every hard cap from `config-live.yaml` re-checked
+  against fresh exchange state (contracts per order, price band, cash reserve,
+  open-position limit, per-market and total exposure, risk halt). Confirm is
+  single-use, expires after 2 minutes, and re-validates everything at send time.
+- **Buys only, IOC limit orders, fee-aware.** Your `config-live.yaml` standards are
+  exactly where they were — the 8¢ model edge gate is *not* applied to discretionary
+  manual bets (it measures the model, not you); every other standard is enforced.
+- Set `ANTHROPIC_API_KEY` (and optionally `ANTHROPIC_MODEL`) via `fly secrets set` —
+  never commit it. `ANTHROPIC_API_KEY` is the only new secret; without it the
+  natural-language path is disabled and the UI says so.
 
 The demo spins up 18 synthetic markets whose hidden true probabilities evolve as
 mean-reverting random walks, quotes imperfect books around them, and runs the

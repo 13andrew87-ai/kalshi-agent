@@ -5,16 +5,24 @@ Modes:
   paper — autonomous agent on REAL Kalshi market data, paper fills (public
           endpoints; no credentials needed for market data)
 
-Real-money live trading intentionally has NO web control: it stays behind the
-CLI's four opt-in gates (see README).
+Real-money live trading intentionally has NO web control from the autonomous agent;
+it stays behind the CLI's four opt-in gates (see README). The dashboard's
+“Ask to place a bet” prompt box is the single deliberate exception: every bet is
+proposed to a human, staged against hard risk caps from config-live.yaml, and
+sent to Kalshi only after an explicit per-bet confirmation (buys, IOC limit,
+fee-aware). See kalshi_agent/webbets.py.
 
 Endpoints:
   GET  /           dashboard (server-rendered, meta-refresh every 5 s, no JS needed)
   GET  /api/state  JSON snapshot
+  GET  /api/funds  signed Kalshi balance JSON
   POST /start      start the agent loop
   POST /pause      pause the agent loop
   POST /reset      wipe state, new universe (auto-restarts if it was running)
   POST /mode       switch sim <-> paper (resets state)
+  POST /bet/preview   interpret prompt, stage order, render confirmation
+  POST /bet/confirm   re-validate + send staged order
+  POST /bet/cancel    discard staged order
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ import json
 import logging
 import os
 import random
+import secrets
 import shutil
 import threading
 import time
@@ -39,10 +48,12 @@ from .auth import KalshiSigner, generate_keypair
 from .brokers import PaperBroker
 from .client import KalshiClient, KalshiApiError
 from .config import AppConfig, DEFAULT_BASE_URL, DEMO_BASE_URL
+from .models import OrderBook
 from .portfolio import Portfolio
 from .risk import RiskManager
 from .sim import SimExchange
 from .report import sparkline_svg
+from . import webbets
 
 log = logging.getLogger("kalshi.web")
 
@@ -208,6 +219,11 @@ class WebDashboard:
         }
         self._load_persisted_credentials()
 
+        # manual betting (prompt box) — hard caps from config-live.yaml
+        self._live_cfg, self._live_cfg_ok = webbets.load_live_cfg()
+        self._funds_cache: dict = {"cents": None, "as_of": 0.0, "env": "", "error": ""}
+        self._pending_bets: dict[str, dict] = {}   # token -> staged bet (120 s TTL)
+
         self.display: dict = {
             "mode": self.mode, "running": False, "cycles": 0, "started_ts": None,
             "last_cycle_ts": None, "last_error": "", "equity_cents": float(cfg.bankroll_cents),
@@ -343,6 +359,192 @@ class WebDashboard:
         self.portfolio = pf
         self.agent = Agent(cfg, source, pf, broker, risk,
                            start_of_day_equity=float(cfg.bankroll_cents))
+
+    # ---------------------------------------------------- manual betting ---
+    def _signed_client(self) -> KalshiClient:
+        cred = self.credentials
+        base = DEMO_BASE_URL if cred.get("env") == "demo" else DEFAULT_BASE_URL
+        probe = AppConfig()
+        probe.base_url = base
+        probe.rate_limit_per_sec = 4.0
+        return KalshiClient(probe, signer=KalshiSigner(cred["key_id"], cred["pem"].encode("utf-8")))
+
+    def funds_snapshot(self, force: bool = False) -> dict:
+        """Signed Kalshi balance for the TOTAL FUNDS card. Cached 30 s;
+        force=True re-pulls (used immediately after a bet is placed)."""
+        cred = self.credentials
+        if not cred.get("validated"):
+            return {"cents": None, "as_of": 0.0, "env": "",
+                    "error": "save + validate credentials first (API keys link)"}
+        c = self._funds_cache
+        now = time.time()
+        if not force and c["cents"] is not None and now - c["as_of"] < 30 and c["env"] == cred.get("env"):
+            return dict(c)
+        try:
+            bal = self._signed_client().get_balance()
+            cents = int(bal.get("balance") or 0)
+            self._funds_cache = {"cents": cents, "as_of": now,
+                                 "env": cred.get("env") or "live", "error": ""}
+        except KalshiApiError as exc:
+            hint = " — re-validate credentials" if exc.status in (401, 403) else ""
+            self._funds_cache = {"cents": None, "as_of": now,
+                                 "env": cred.get("env") or "live",
+                                 "error": f"balance fetch failed ({exc.status}){hint}"}
+        except Exception as exc:  # noqa: BLE001
+            self._funds_cache = {"cents": None, "as_of": now,
+                                 "env": cred.get("env") or "live",
+                                 "error": f"balance fetch failed: {exc}"}
+        return dict(self._funds_cache)
+
+    def _sweep_pending(self) -> None:
+        now = time.time()
+        for tok in [t for t, b in self._pending_bets.items() if now - b["created"] > b["ttl_s"]]:
+            del self._pending_bets[tok]
+
+    def _positions_open(self, client: KalshiClient) -> list[dict]:
+        try:
+            return client.get_positions("open") or []
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bet: positions fetch failed: %s", exc)
+            return []
+
+    def _halt_state(self) -> tuple[bool, str]:
+        return webbets.live_halt_state(os.path.join(self.cfg.state_dir, "live", "risk_state.json"))
+
+    def stage_buy(self, *, ticker: str, side: str, count: int,
+                  price_cents: int | None, rationale: str = "") -> dict:
+        """Validate a proposed BUY against live exchange state + risk caps.
+        Returns {"ok": True, "bet": {...}} or {"ok": False, "error": str, ...}."""
+        cred = self.credentials
+        if not cred.get("validated"):
+            return {"ok": False, "error": "save + validate credentials first"}
+        client = self._signed_client()
+        # market must exist and be tradeable
+        try:
+            market = client.get_market(ticker)
+        except KalshiApiError as exc:
+            return {"ok": False, "error": f"market {ticker} not found / not accessible ({exc.status})"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"market lookup failed: {exc}"}
+        status = str(market.get("status") or "").lower()
+        if status and status not in ("open", "active"):
+            return {"ok": False, "error": f"{ticker} is '{status}' — only open markets can be bought"}
+        title = str(market.get("title") or "")
+        # resolve price: explicit or best ask
+        if price_cents is None:
+            try:
+                book = OrderBook.from_api(client.get_orderbook(ticker), ticker)
+                ask = book.best_ask(side)
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": f"couldn't read the order book: {exc}"}
+            if ask is None:
+                return {"ok": False, "error": f"no one is selling {side.upper()} on {ticker} right now"}
+            price_cents = ask.price_cents
+        fee = webbets.estimate_fee_cents(count, price_cents, self._live_cfg.taker_fee_multiplier)
+        spend = count * price_cents + fee
+        try:
+            bal = self._signed_client().get_balance()
+            balance_cents = int(bal.get("balance") or 0)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"couldn't fetch your balance: {exc}"}
+        positions = self._positions_open(client)
+        halted, halt_reason = self._halt_state()
+        assessment = webbets.assess_buy(
+            self._live_cfg, balance_cents=balance_cents, count=count,
+            price_cents=price_cents, ticker=ticker, positions=positions,
+            halted=halted, halt_reason=halt_reason)
+        bet = {
+            "ticker": ticker, "title": title, "side": side, "count": count,
+            "price_cents": price_cents, "fee_cents": fee, "cost_cents": spend,
+            "balance_before_cents": balance_cents, "rationale": rationale,
+            "env": cred.get("env") or "live", "checks": assessment["checks"],
+            "checks_ok": assessment["ok"],
+            "max_contracts": self._live_cfg.max_contracts_per_order,
+            "created": time.time(),
+        }
+        if not assessment["ok"]:
+            return {"ok": False, "error": "risk caps blocked this bet — see the checks below",
+                    "bet": bet}
+        return {"ok": True, "bet": bet}
+
+    def stage_pending(self, bet: dict) -> str:
+        self._sweep_pending()
+        if len(self._pending_bets) >= 8:            # never let the dict grow unbounded
+            oldest = min(self._pending_bets, key=lambda t: self._pending_bets[t]["created"])
+            del self._pending_bets[oldest]
+        token = secrets.token_hex(12)
+        bet = dict(bet)
+        bet["created"] = time.time()
+        bet["ttl_s"] = 120
+        self._pending_bets[token] = bet
+        return token
+
+    def pending_get(self, token: str) -> dict | None:
+        self._sweep_pending()
+        bet = self._pending_bets.get(token)
+        return dict(bet) if bet else None
+
+    def pending_pop(self, token: str) -> dict | None:
+        bet = self._pending_bets.pop(token, None)
+        return dict(bet) if bet else None
+
+    def confirm_pending(self, token: str) -> dict:
+        """Re-validate a staged bet from scratch, then place it. Single-use."""
+        bet = self.pending_pop(token)
+        if bet is None:
+            return {"ok": False, "error": "that staged bet expired or was already used (2 min limit) — ask again"}
+        # re-check EVERYTHING against fresh exchange state
+        staged = self.stage_buy(ticker=bet["ticker"], side=bet["side"],
+                                count=bet["count"], price_cents=bet["price_cents"],
+                                rationale=bet.get("rationale", ""))
+        if not staged["ok"]:
+            return {"ok": False,
+                    "error": "refused at send time — " + str(staged.get("error", "risk caps no longer pass")),
+                    "bet": staged.get("bet")}
+        fresh = staged["bet"]
+        cfg = self._live_cfg
+        from .models import Intent
+        intent = Intent(ticker=fresh["ticker"], side=fresh["side"], action="buy",
+                        count=fresh["count"], price_cents=fresh["price_cents"],
+                        rationale=fresh.get("rationale", "") or "manual prompt-box bet")
+        tif_map = {"ioc": "immediate_or_cancel", "gtc": "good_till_canceled",
+                   "fok": "fill_or_kill"}
+        body: dict = {
+            "ticker": intent.ticker,
+            "type": "limit",
+            "action": intent.action,
+            "side": intent.side,
+            "count": intent.count,
+            "time_in_force": tif_map.get(cfg.order_type, "immediate_or_cancel"),
+            "client_order_id": intent.client_order_id(),
+        }
+        if intent.side == "yes":
+            body["yes_price"] = intent.price_cents
+        else:
+            body["no_price"] = intent.price_cents
+        env = self.credentials.get("env") or "live"
+        log.warning("MANUAL BET (%s): %s", env.upper(), body)
+        client = self._signed_client()
+        try:
+            resp = client.create_order(body)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("manual bet rejected")
+            return {"ok": False, "error": f"Kalshi rejected the order: {exc}", "bet": fresh}
+        order = resp.get("order", {}) or {}
+        try:
+            filled = int(order.get("taker_fill_count") or order.get("filled_count") or 0)
+        except (TypeError, ValueError):
+            filled = 0
+        # refresh TOTAL FUNDS immediately after any placed bet
+        funds = self.funds_snapshot(force=True)
+        return {
+            "ok": True,
+            "bet": fresh,
+            "filled": filled,
+            "order_id": str(order.get("order_id") or ""),
+            "funds": funds,
+            "env": env,
+        }
 
     # ------------------------------------------------------------ control ---
     def poll(self) -> float:
@@ -490,6 +692,7 @@ class WebDashboard:
                             and not self._stop_event.is_set())
         d["now"] = time.time()
         d["logs"] = list(self.log_handler.ring)[-40:]
+        d["funds"] = self.funds_snapshot()
         return d
 
     # ------------------------------------------------------------ rendering ---
@@ -506,6 +709,7 @@ class WebDashboard:
         age = f"{s['now'] - s['last_cycle_ts']:.0f}s ago" if s["last_cycle_ts"] else "never"
         err = s["last_error"]
 
+        funds = s.get("funds") or {}
         base = _base()
         status_txt, status_color = (
             ("RUNNING", "#22c55e") if s["running"] else ("PAUSED", "#eab308"))
@@ -591,6 +795,7 @@ page auto-refreshes every 5s &middot; real-money live trading is CLI-gated (see 
 {err_html}
 
 <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;">
+{_funds_card(funds)}
 {_card('EQUITY', f"{eq:,.2f}$", f"{ret:+.2f}% return", '#22c55e' if ret >= 0 else '#ef4444')}
 {_card('CASH', f"{s['cash_cents'] / 100:,.2f}$", 'free to deploy')}
 {_card('OPEN POSITIONS', f"{pos_count}", f"max {self.cfg.max_open_positions}")}
@@ -601,6 +806,8 @@ page auto-refreshes every 5s &middot; real-money live trading is CLI-gated (see 
 </div>
 
 <div style="margin-bottom:16px;">{svg}</div>
+
+{_bet_panel(self, funds, base)}
 
 {_panel('LAST SCAN — SIGNALS (' + str(len(s['signals'])) + ' markets evaluated)', '''
 <table style="width:100%;border-collapse:collapse;font-size:13px;">
@@ -856,6 +1063,159 @@ def _sel_style() -> str:
             "padding:7px 8px;font-size:13px;font-family:inherit;margin-right:6px;")
 
 
+def _fmt_usd(cents) -> str:
+    return f"{(cents or 0) / 100:,.2f}$"
+
+
+def _env_label(env: str) -> tuple[str, str]:
+    """(short label, accent color) for the credential environment."""
+    return ("DEMO · play money", "#93c5fd") if env == "demo" else ("REAL MONEY", "#f87171")
+
+
+def _funds_card(funds: dict) -> str:
+    env = (funds or {}).get("env") or "live"
+    label, accent = _env_label(env)
+    cents = (funds or {}).get("cents")
+    err = (funds or {}).get("error") or ""
+    as_of = (funds or {}).get("as_of") or 0.0
+    if cents is not None:
+        age = max(0, int(time.time() - as_of))
+        return _card(f'TOTAL FUNDS · KALSHI <span style="font-size:10px;color:{accent}">{label}</span>',
+                     f"{_fmt_usd(cents)}",
+                     f"signed exchange balance · refreshed {age}s ago", '#38bdf8')
+    sub = err or "unavailable"
+    return _card(f'TOTAL FUNDS · KALSHI <span style="font-size:10px;color:{accent}">{label}</span>',
+                 "—", _esc(sub), '#ef4444')
+
+
+def _bet_form(base: str, prompt_value: str = "") -> str:
+    return f'''<form method="post" action="{base}/bet/preview" style="margin:0">
+<textarea name="prompt" rows="2" placeholder="buy 1 yes KXNFLGAME-26NOV25-KC 25c  ·  or plain English: &quot;put a dollar on the Chiefs to win tonight&quot;" required
+ style="width:100%;box-sizing:border-box;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:10px;font-size:13px;font-family:inherit;resize:vertical;">{_esc(prompt_value)}</textarea>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:10px;flex-wrap:wrap;">
+<span style="color:#64748b;font-size:11px;">You see the full order + fees + risk checks BEFORE anything is sent. Nothing is ever sent automatically.</span>
+<button style="{_btn_style('#7c3aed')}">Propose bet &#8594;</button>
+</div></form>'''
+
+
+def _bet_panel(dash: "WebDashboard", funds: dict, base: str) -> str:
+    cred = dash.credentials
+    if not cred.get("validated"):
+        return _panel('ASK TO PLACE A BET',
+            '<div style="color:#94a3b8;font-size:13px;">Save + validate your Kalshi credentials first '
+            f'— then this box can propose real (or demo) bets, sized by your config-live.yaml rules. '
+            f'<a href="{base}/credentials" style="color:#93c5fd;">API keys &amp; credentials</a></div>')
+    env = cred.get("env") or "live"
+    label, accent = _env_label(env)
+    llm = "Claude connected" if os.environ.get("ANTHROPIC_API_KEY") else "ticket syntax only (no ANTHROPIC_API_KEY on server)"
+    cfg_note = "config-live.yaml caps loaded" if dash._live_cfg_ok else "config-live.yaml NOT found — falling back to built-in defaults"
+    caps = (f"max {dash._live_cfg.max_contracts_per_order} contracts/order · price band "
+            f"{dash._live_cfg.min_price_cents}–{dash._live_cfg.max_price_cents}c · "
+            f"IOC limit · fee-aware · buys only · 8&cent; model edge gate does NOT apply to manual bets")
+    warning = ("<div style='background:#450a0a;border:1px solid #b91c1c;border-radius:8px;padding:8px 12px;"
+               "margin-bottom:10px;color:#fca5a5;font-size:12px;'><b>REAL MONEY MODE</b> — confirming a bet "
+               "sends an actual order to Kalshi. Double-check the market, price and size.</div>"
+               if env == "live" else
+               "<div style='background:#082f49;border:1px solid #0ea5e9;border-radius:8px;padding:8px 12px;"
+               "margin-bottom:10px;color:#7dd3fc;font-size:12px;'>DEMO mode — orders use play money on the "
+               "Kalshi demo exchange. Rehearse here first.</div>")
+    return _panel(f'ASK TO PLACE A BET <span style="font-size:10px;color:{accent}">{label}</span>',
+                  warning + _bet_form(base) +
+                  f'<div style="color:#64748b;font-size:11px;margin-top:8px;">{caps} · {cfg_note} · {_esc(llm)}</div>')
+
+
+def _bet_checks_rows(checks: list) -> str:
+    rows = ""
+    for label, ok, detail in checks:
+        icon = "&#10003;" if ok else "&#10007;"
+        color = "#22c55e" if ok else "#ef4444"
+        rows += f'<tr><td style="color:{color};width:24px;">{icon}</td><td>{_esc(str(label))}</td><td style="color:#64748b;">{_esc(str(detail))}</td></tr>'
+    return f'<table style="width:100%;border-collapse:collapse;font-size:12px;">{rows}</table>'
+
+
+_BET_STYLE = "max-width:720px;margin:0 auto;padding:20px;color:#e2e8f0;font-family:ui-monospace,Menlo,Consolas,monospace;"
+
+
+def render_bet_confirm(dash: "WebDashboard", bet: dict, token: str, error: str = "") -> str:
+    env = bet.get("env") or "live"
+    label, accent = _env_label(env)
+    base = _base()
+    loss_note = ("REAL MONEY" if env == "live" else "DEMO · play money")
+    err_html = (f'<div style="background:#450a0a;border:1px solid #b91c1c;border-radius:8px;padding:10px 14px;'
+                f'margin-bottom:12px;color:#fca5a5;">{_esc(error)}</div>' if error else "")
+    caps_ok = bet.get("checks_ok", False)
+    confirm_disabled = "" if caps_ok else "disabled"
+    confirm_style = _btn_style('#b91c1c' if env == "live" else '#166534', disabled=not caps_ok)
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>Confirm bet — Kalshi Agent</title></head>
+<body style="margin:0;background:#0b1220;"><div style="{_BET_STYLE}">
+<a href="{base}/" style="color:#64748b;font-size:12px;text-decoration:none;">&larr; back to dashboard</a>
+<h1 style="font-size:20px;margin:14px 0 2px;">Confirm your bet <span style="font-size:11px;color:{accent};border:1px solid {accent};border-radius:999px;padding:2px 10px;vertical-align:middle;">{label}</span></h1>
+<div style="color:#64748b;font-size:12px;margin-bottom:14px;">This is the only step that can send anything. Review everything, then confirm.</div>
+{err_html}
+<div style="background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:16px;margin-bottom:14px;">
+<div style="font-size:16px;font-weight:bold;margin-bottom:4px;">BUY {bet['count']} &times; {_esc(bet['side'].upper())} &middot; {_esc(bet['ticker'])}</div>
+<div style="color:#94a3b8;font-size:13px;margin-bottom:12px;">{_esc(bet.get('title') or '')}</div>
+<table style="width:100%;border-collapse:collapse;font-size:13px;">
+<tr><td style="color:#64748b;padding:2px 0;">limit price</td><td><b>{bet['price_cents']}c</b> per contract</td></tr>
+<tr><td style="color:#64748b;padding:2px 0;">order cost</td><td><b>{_fmt_usd(bet['count'] * bet['price_cents'])}</b></td></tr>
+<tr><td style="color:#64748b;padding:2px 0;">est. taker fee</td><td>{_fmt_usd(bet['fee_cents'])}</td></tr>
+<tr><td style="color:#64748b;padding:2px 0;">total at risk</td><td><b>{_fmt_usd(bet['cost_cents'])}</b></td></tr>
+<tr><td style="color:#64748b;padding:2px 0;">balance before</td><td>{_fmt_usd(bet['balance_before_cents'])}</td></tr>
+<tr><td style="color:#64748b;padding:2px 0;">balance after (if fully filled)</td><td>{_fmt_usd(bet['balance_before_cents'] - bet['cost_cents'])}</td></tr>
+<tr><td style="color:#64748b;padding:2px 0;">order type</td><td>limit &middot; {_esc(dash._live_cfg.order_type.upper())} &middot; buys only</td></tr>
+</table>
+{f'<div style="margin-top:10px;color:#c4b5fd;font-size:12px;border-left:3px solid #7c3aed;padding-left:10px;">rationale: {_esc(bet.get("rationale") or "")}</div>' if bet.get("rationale") else ''}
+</div>
+<div style="margin-bottom:14px;">{_panel('RISK CHECKS — config-live.yaml standards, exchange-state verified', _bet_checks_rows(bet.get('checks') or []))}</div>
+<div style="display:flex;gap:10px;align-items:center;">
+<form method="post" action="{base}/bet/confirm" style="margin:0"><input type="hidden" name="token" value="{_esc(token)}"><button {confirm_disabled} style="{confirm_style}">{'&#128293; SEND REAL ORDER' if env == 'live' else 'Place demo order'}</button></form>
+<form method="post" action="{base}/bet/cancel" style="margin:0"><input type="hidden" name="token" value="{_esc(token)}"><button style="{_btn_style('#374151')}">Cancel</button></form>
+<span style="color:#64748b;font-size:11px;">single-use token · expires 2 min after it was created · {loss_note}</span>
+</div>
+<div style="color:#475569;font-size:11px;margin-top:16px;">No guaranteed edge. Manual bets are discretionary — the 8&cent; model edge gate is not applied, every other standard from config-live.yaml is. Not financial advice.</div>
+</div></body></html>"""
+
+
+def render_bet_result(outcome: dict) -> str:
+    base = _base()
+    if not outcome.get("ok"):
+        inner = f"""<h1 style="font-size:20px;margin:18px 0 8px;color:#f87171;">Bet not placed</h1>
+<div style="background:#450a0a;border:1px solid #b91c1c;border-radius:8px;padding:12px 14px;color:#fca5a5;margin-bottom:14px;">{_esc(str(outcome.get('error') or 'unknown error'))}</div>"""
+        bet = outcome.get("bet") or {}
+        if bet.get("checks"):
+            inner += _panel('RISK CHECKS AT SEND TIME', _bet_checks_rows(bet["checks"]))
+        inner += f'<div style="margin-top:16px;"><a href="{base}/" style="color:#93c5fd;">&larr; back to dashboard</a></div>'
+        return f'<!doctype html><html><head><meta charset="utf-8"><title>Bet failed — Kalshi Agent</title></head><body style="margin:0;background:#0b1220;"><div style="{_BET_STYLE}">{inner}</div></body></html>'
+    bet = outcome.get("bet") or {}
+    env = outcome.get("env") or "live"
+    filled = outcome.get("filled", 0)
+    order_id = outcome.get("order_id") or "-"
+    funds = outcome.get("funds") or {}
+    funds_txt = (f"{_fmt_usd(funds.get('cents'))}" if funds.get("cents") is not None
+                 else _esc(str(funds.get("error") or "refresh failed — will retry on next dashboard load")))
+    inner = f"""<h1 style="font-size:20px;margin:18px 0 8px;color:#22c55e;">Order sent to Kalshi</h1>
+<div style="background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:16px;margin-bottom:14px;font-size:13px;">
+<div style="font-size:15px;font-weight:bold;margin-bottom:8px;">BUY {bet.get('count')} &times; {_esc(str(bet.get('side', '')).upper())} &middot; {_esc(str(bet.get('ticker', '')))} @ {bet.get('price_cents')}c (limit, {_esc(env.upper())})</div>
+<div style="color:#94a3b8;">order id: {_esc(str(order_id))}</div>
+<div style="color:#94a3b8;">filled (taker): <b>{filled}</b> of {bet.get('count')} contracts</div>
+<div style="color:#38bdf8;margin-top:10px;font-size:15px;">TOTAL FUNDS now: <b>{funds_txt}</b></div>
+</div>
+<div style="color:#64748b;font-size:12px;margin-bottom:14px;">Funds were re-pulled from Kalshi right after this order — the dashboard tile shows the same fresh number.</div>
+<a href="{base}/" style="color:#93c5fd;">&larr; back to dashboard</a>"""
+    return f'<!doctype html><html><head><meta charset="utf-8"><title>Bet placed — Kalshi Agent</title></head><body style="margin:0;background:#0b1220;"><div style="{_BET_STYLE}">{inner}</div></body></html>'
+
+
+def render_bet_error(msg: str, prompt_value: str = "") -> str:
+    base = _base()
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>Bet — Kalshi Agent</title></head>
+<body style="margin:0;background:#0b1220;"><div style="{_BET_STYLE}">
+<a href="{base}/" style="color:#64748b;font-size:12px;text-decoration:none;">&larr; back to dashboard</a>
+<h1 style="font-size:20px;margin:18px 0 8px;">Couldn't stage that bet</h1>
+<div style="background:#450a0a;border:1px solid #b91c1c;border-radius:8px;padding:12px 14px;color:#fca5a5;white-space:pre-wrap;margin-bottom:14px;">{_esc(msg)}</div>
+{_panel('ASK TO PLACE A BET', _bet_form(base, prompt_value))}
+</div></body></html>"""
+
+
 # ----------------------------------------------------------------- server ---
 class _Handler(BaseHTTPRequestHandler):
     dashboard: WebDashboard = None  # injected
@@ -956,6 +1316,8 @@ class _Handler(BaseHTTPRequestHandler):
                                        "attachment; filename=kalshi_private_key.pem")])
         elif path == "/api/state":
             self._json(self.dashboard.state())
+        elif path == "/api/funds":
+            self._json(self.dashboard.funds_snapshot())
         else:
             self._html("not found", "text/plain; charset=utf-8", status=404)
 
@@ -991,6 +1353,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not authed:
             self._redirect("/")
             return
+
+        if path and path.startswith("/bet/"):
+            self._handle_bet_post(path, form)
+            return
+
         try:
             if path == "/start":
                 self.dashboard.start()
@@ -1020,6 +1387,83 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             suffix = "/credentials" if path.startswith("/credentials") else "/"
             self._redirect(_base() + suffix)
+
+    def _parse_proposal(self, prompt: str) -> tuple[dict | None, str | None]:
+        """Returns (proposal, immediate_message). proposal: ticker/side/count/price_cents/rationale."""
+        parsed = webbets.parse_bet_prompt(prompt)
+        if parsed.get("ok") and parsed.get("action") == "buy":
+            return ({"ticker": parsed["ticker"], "side": parsed["side"],
+                     "count": parsed["count"], "price_cents": parsed["price_cents"],
+                     "rationale": "manual order ticket"}, None)
+        if parsed.get("ok") and parsed.get("action") == "help":
+            return (None, parsed["msg"])
+        if parsed.get("ok") and parsed.get("action") == "funds":
+            return (None, "__FUNDS__")
+        if not parsed.get("ok") and webbets.looks_like_ticket(prompt):
+            return (None, parsed.get("msg") or "couldn't parse ticket")
+        # natural language path — needs an LLM key on the server
+        dash = self.dashboard
+        cfg = dash._live_cfg
+        cred = dash.credentials
+        base_url = DEMO_BASE_URL if cred.get("env") == "demo" else DEFAULT_BASE_URL
+        pub_cfg = AppConfig()
+        pub_cfg.base_url = base_url
+        pub_cfg.rate_limit_per_sec = 4.0
+        pub = KalshiClient(pub_cfg, signer=None)   # public endpoints only
+        try:
+            catalog = webbets.market_catalog(pub, list(cfg.series_watchlist or []),
+                                             per_series=20, max_total=140)
+        except Exception as exc:  # noqa: BLE001
+            catalog = []
+            log.warning("bet: market catalog fetch failed: %s", exc)
+        out = webbets.interpret_with_claude(prompt, catalog=catalog, cfg=cfg)
+        if out.get("action") == "propose":
+            return ({"ticker": out["ticker"], "side": out["side"], "count": out["count"],
+                     "price_cents": out.get("price_cents"),
+                     "rationale": out.get("rationale", "")}, None)
+        return (None, out.get("message") or "couldn't turn that into a bet")
+
+    def _handle_bet_post(self, path: str, form: dict) -> None:
+        dash = self.dashboard
+        base = _base()
+        try:
+            if path == "/bet/cancel":
+                token = (form.get("token") or [""])[0]
+                dash.pending_pop(token)
+                self._redirect(base + "/")
+                return
+            if path == "/bet/confirm":
+                token = (form.get("token") or [""])[0]
+                outcome = dash.confirm_pending(token)
+                self._html(render_bet_result(outcome))
+                return
+            if path == "/bet/preview":
+                prompt = (form.get("prompt") or [""])[0].strip()
+                if not prompt:
+                    self._html(render_bet_error("empty prompt"))
+                    return
+                proposal, immediate = self._parse_proposal(prompt)
+                if immediate == "__FUNDS__":
+                    self._redirect(base + "/")
+                    return
+                if immediate:
+                    self._html(render_bet_error(immediate, prompt))
+                    return
+                staged = dash.stage_buy(**proposal)
+                if not staged.get("ok"):
+                    bet = staged.get("bet") or {}
+                    if bet.get("checks"):            # risk-cap failure: show the checklist
+                        self._html(render_bet_confirm(dash, bet, "", error=staged.get("error", "")))
+                    else:
+                        self._html(render_bet_error(staged.get("error") or "couldn't stage that bet", prompt))
+                    return
+                token = dash.stage_pending(staged["bet"])
+                self._html(render_bet_confirm(dash, staged["bet"], token))
+                return
+            self._html("not found", "text/plain; charset=utf-8", status=404)
+        except Exception:  # noqa: BLE001
+            log.exception("bet POST %s failed", path)
+            self._html(render_bet_error("internal error — see the log; nothing was sent"))
 
     def log_message(self, fmt, *args) -> None:  # quiet default access log
         log.debug("http %s", fmt % args)
