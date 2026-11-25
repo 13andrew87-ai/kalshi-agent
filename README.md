@@ -104,7 +104,7 @@ Live trading requires **all** of these, in order:
 ```bash
 # recommended path
 python -m kalshi_agent.cli config-check        # verifies signing works
-export KALSHI_DEMO=1                           # aim at demo.elections.kalshi.com (fake money)
+export KALSHI_DEMO=1                           # aim at demo-api.kalshi.co (fake money)
 python -m kalshi_agent.cli live --live         # dry-run orders against the demo exchange
 python -m kalshi_agent.cli paper               # paper-trade against REAL market data
 # only when consistently profitable, and at sizes you can lose:
@@ -118,7 +118,7 @@ Safety commands: `cancel-all` (panic button), `resume` (clear a risk halt),
 ## API integration notes
 
 - Base URL: `https://api.elections.kalshi.com/trade-api/v2`
-  (demo: `https://demo.elections.kalshi.com/trade-api/v2` via `KALSHI_DEMO=1`).
+  (demo: `https://demo-api.kalshi.co/trade-api/v2` via `KALSHI_DEMO=1`).
 - Auth: RSA-PSS-SHA256 over `timestamp_ms + METHOD + path` (path excludes query),
   headers `KALSHI-ACCESS-KEY / -TIMESTAMP / -SIGNATURE`. Implemented in
   `kalshi_agent/auth.py` and verified by tests against a real keypair.

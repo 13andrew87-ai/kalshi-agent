@@ -749,7 +749,7 @@ def render_credentials(self: "WebDashboard") -> str:
         "<div style=\"margin-bottom:10px;\">"
         "<label style=\"color:#64748b;font-size:11px;\">ENVIRONMENT</label><br>"
         f"<select name=\"env\" style=\"{_sel_style()}\">"
-        f"<option value=\"demo\" {sel_demo}>demo.elections.kalshi.com — fake money</option>"
+        f"<option value=\"demo\" {sel_demo}>demo-api.kalshi.co — fake money</option>"
         f"<option value=\"live\" {sel_live}>api.elections.kalshi.com — REAL account</option>"
         "</select></div>"
         "<label style=\"font-size:12px;color:#94a3b8;\"><input type=\"checkbox\" name=\"persist\" value=\"1\"> "

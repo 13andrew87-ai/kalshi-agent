@@ -9,7 +9,7 @@ from typing import Any
 import yaml
 
 DEFAULT_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-DEMO_BASE_URL = "https://demo.elections.kalshi.com/trade-api/v2"
+DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"  # Kalshi demo is .co, not .elections.kalshi.com (NXDOMAIN)
 
 
 @dataclass
@@ -20,7 +20,7 @@ class AppConfig:
     api_key_id: str = ""                      # KALSHI_API_KEY_ID
     private_key_path: str = ""                # KALSHI_PRIVATE_KEY_PATH (PEM)
     base_url: str = DEFAULT_BASE_URL
-    use_demo_env: bool = False                # demo.elections.kalshi.com (fake money)
+    use_demo_env: bool = False                # demo-api.kalshi.co (fake money)
 
     # --- trading mode ------------------------------------------------------------
     mode: str = "paper"                       # paper | live

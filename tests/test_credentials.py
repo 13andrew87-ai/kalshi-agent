@@ -97,7 +97,7 @@ def test_signed_probe_against_real_demo_endpoint_fails_cleanly():
     import requests
 
     try:
-        requests.get("https://demo.elections.kalshi.com/trade-api/v2/exchange/status", timeout=4)
+        requests.get("https://demo-api.kalshi.co/trade-api/v2/exchange/status", timeout=4)
     except Exception:
         print("network unreachable — skipping live probe test")
         return

@@ -4,7 +4,7 @@
 # ---------- identity / connectivity ----------
 api_key_id: ""                              # or env KALSHI_API_KEY_ID
 private_key_path: "kalshi_private_key.pem"  # or env KALSHI_PRIVATE_KEY_PATH
-use_demo_env: false                         # true -> demo.elections.kalshi.com (fake money)
+use_demo_env: false                         # true -> demo-api.kalshi.co (fake money)
 
 # ---------- trading mode ----------
 mode: paper                                 # paper | live
