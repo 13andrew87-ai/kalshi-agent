@@ -5,7 +5,7 @@
 # 4. fly volumes create kalshi_state --size 1
 # 5. fly deploy
 
-app = "kalshi-agent"
+app = "kalshi-agent-andrew"
 primary_region = "lax"   # Los Angeles — nearest Fly region to Phoenix, AZ (phx does not exist)
 
 [build]
