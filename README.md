@@ -203,3 +203,24 @@ mechanics, determinism per seed, and the risk halt blocking entries end-to-end.
 
 **Not financial advice. Event contracts can and do lose money. Trade at your own
 risk, start in paper mode, and never risk what you cannot afford to lose.**
+
+## Public access (outside the preview frame)
+
+The deployed dashboard is publicly reachable at the Arena preview URL for this
+workspace's `API Keys & Dashboard` process (see the running process in your
+Arena session — the URL looks like `https://<sandbox-id>.arena.site/`).
+
+- It is **not** bound to the preview iframe: anyone on the internet can reach
+  it and see the sign-in page.
+- Everything except `/healthz` sits behind the password gate (env
+  `KALSHI_WEB_PASSWORD`, 128-bit random — stored outside git at
+  `state/web_password.txt`, mode 0600). Successful sign-in redirects to the
+  token-prefixed URL, which proxies correctly through the Arena gateway.
+- Rotating: stop the web process, restart with a new
+  `KALSHI_WEB_PASSWORD` — the URL token rotates with it and all old links die.
+- Do **not** commit the password or the URL into a public repo without
+  understanding that the app fronts a REAL-money account (live trading +
+  API-key download behind the gate).
+- Durability: the public URL lives as long as this sandbox and the web
+  process live. A permanent host requires your own infrastructure (see above) —
+  treat this as published-but-ephemeral, not production hosting.
