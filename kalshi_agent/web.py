@@ -232,6 +232,8 @@ class WebDashboard:
                     "I’ll stage it and ask YES/NO before anything is sent."),
         ]
         self._chat_pending: str | None = None        # token of the bet awaiting YES/NO
+        self._bet_queue: list[str] = []              # remaining batch tokens after the current one
+        self._bet_batch: dict | None = None          # {"staged","done","filled","refused","passed","note"}
         self._account_cache: dict = {"ts": 0.0, "positions": None, "fills": None, "error": ""}
 
         self.display: dict = {
@@ -509,7 +511,7 @@ class WebDashboard:
                     "bet": bet}
         return {"ok": True, "bet": bet}
 
-    def stage_pending(self, bet: dict) -> str:
+    def stage_pending(self, bet: dict, ttl_s: float = 120.0) -> str:
         self._sweep_pending()
         if len(self._pending_bets) >= 8:            # never let the dict grow unbounded
             oldest = min(self._pending_bets, key=lambda t: self._pending_bets[t]["created"])
@@ -517,7 +519,7 @@ class WebDashboard:
         token = secrets.token_hex(12)
         bet = dict(bet)
         bet["created"] = time.time()
-        bet["ttl_s"] = 120
+        bet["ttl_s"] = ttl_s
         self._pending_bets[token] = bet
         return token
 
@@ -1847,6 +1849,7 @@ class _Handler(BaseHTTPRequestHandler):
                              "• or plain English if Claude is configured\n"
                              "• funds — re-pull your Kalshi balance\n"
                              "• yes / no — answer a pending bet\n"
+                             "• “make four 75 cent bets on the most likely markets” — plain-English multi-bet batch, YES each\n"
                              "• maximize profits for N minutes — all-market hunt (any liquid market), time-boxed\n"
                              "• hunt / next pick — fetch my current best pick while a hunt window is live\n"
                              "• stop hunting — kill the window early\n"
@@ -1855,6 +1858,9 @@ class _Handler(BaseHTTPRequestHandler):
         proposal, immediate = self._parse_proposal(prompt)
         if proposal is None:
             dash.chat("app", immediate if immediate != "__FUNDS__" else "funds refreshed — see the tile above.")
+            return
+        if proposal.get("action") == "multi":
+            self._stage_multi(proposal)
             return
         action = proposal.pop("action", "buy")
         staged = dash.stage_order(action, **proposal)
@@ -1881,6 +1887,99 @@ class _Handler(BaseHTTPRequestHandler):
                   f"balance after ≈ {_fmt_usd(bet['balance_before_cents'] + (bet.get('proceeds_cents', 0) if action == 'sell' else -bet['cost_cents']))}\n"
                   f"{cap_line}\n\n"
                   f"Reply YES to send it, or NO to cancel. (2-minute expiry)")
+
+    # ---------------------------------------------------------- batches --
+    def _batch_prompt(self, token: str) -> None:
+        dash = self.dashboard
+        bet = dash.pending_get(token)
+        if not bet or dash._bet_batch is None:
+            return
+        b = dash._bet_batch
+        pos = b["staged"] - len(dash._bet_queue)
+        cash_line = f"total ≈ {_fmt_usd(bet['cost_cents'])} (incl. ~{_fmt_usd(bet['fee_cents'])} fee)"
+        dash._chat_pending = token
+        dash.chat("app",
+                  f"Bet {pos} of {b['staged']} · BUY {bet['count']} × {bet['side'].upper()} · {bet['ticker']}\n"
+                  f"{bet.get('title') or ''}\n"
+                  f"limit {bet['price_cents']}c (IOC) · {cash_line}\n"
+                  f"rationale: {bet.get('rationale') or 'multi-bet pick'}\n"
+                  f"Reply YES to send, or NO to pass.")
+
+    def _advance_batch(self) -> None:
+        dash = self.dashboard
+        if dash._bet_batch is None:
+            return
+        if not dash._bet_queue:
+            b = dash._bet_batch
+            lines = [f"📋 Batch complete — decided {b['done']} of {b['staged']} staged."]
+            lines += [f"✅ {t}" for t in b["filled"]]
+            lines += [f"⏭️ passed: {t}" for t in b["passed"]]
+            lines += [f"✗ not sent: {t}" for t in b["refused"]]
+            if b.get("note"):
+                lines.append(f"note: {b['note']}")
+            dash.chat("app", "\n".join(lines))
+            dash._bet_batch = None
+            return
+        token = dash._bet_queue.pop(0)
+        if dash.pending_get(token) is None:      # expired mid-batch — skip silently-ish
+            dash._bet_batch["refused"].append("(expired)")
+            self._advance_batch()
+            return
+        self._batch_prompt(token)
+
+    def _batch_outcome(self, key: str, desc: str) -> None:
+        dash = self.dashboard
+        if dash._bet_batch is not None:
+            dash._bet_batch["done"] += 1
+            dash._bet_batch[key].append(desc)
+
+    def _stage_multi(self, plan: dict) -> None:
+        dash = self.dashboard
+        if dash._bet_batch is not None:
+            dash.chat("app", "Finish the batch you're on first — answer YES or NO to the pending bet, then ask again.")
+            return
+        legs = plan.get("legs") or []
+        stake = plan.get("stake_cents")
+        accepted, refused = [], []
+        for leg in legs[:8]:
+            count, price = leg["count"], leg.get("price_cents")
+            staged = dash.stage_order("buy", ticker=leg["ticker"], side=leg["side"],
+                                      count=count, price_cents=price,
+                                      rationale=leg.get("rationale") or "multi-bet leg")
+            # shrink to fit a named per-bet stake, if any
+            while (staged.get("ok") and stake
+                   and staged["bet"]["cost_cents"] > stake
+                   and staged["bet"]["count"] > 1):
+                count -= 1
+                staged = dash.stage_order("buy", ticker=leg["ticker"], side=leg["side"],
+                                          count=count, price_cents=price,
+                                          rationale=leg.get("rationale") or "multi-bet leg")
+            if not staged.get("ok"):
+                refused.append(f"{leg['ticker']} — {staged.get('error')}")
+                continue
+            bet = staged["bet"]
+            if stake and bet["cost_cents"] > stake:
+                refused.append(f"{leg['ticker']} — 1 contract ({_fmt_usd(bet['cost_cents'])}) exceeds your {_fmt_usd(stake)} stake")
+                continue
+            accepted.append(bet)
+        refused_lines = "\n".join(f"✗ skipped {r}" for r in refused)
+        if not accepted:
+            dash.chat("app", (refused_lines + "\n" if refused_lines else "")
+                      + "Nothing staged — every leg tripped a cap. Your money stays put.")
+            return
+        tokens = [dash.stage_pending(bet, ttl_s=600) for bet in accepted]
+        dash._bet_batch = {"staged": len(accepted), "done": 0,
+                           "filled": [], "refused": list(refused), "passed": [],
+                           "note": plan.get("note") or ""}
+        dash._bet_queue = list(tokens)
+        plan_lines = "\n".join(
+            f"{i + 1}. BUY {b['count']} {b['side'].upper()} {b['ticker']} @ {b['price_cents']}c"
+            for i, b in enumerate(accepted))
+        stake_txt = f" · per-bet stake ≤ {_fmt_usd(stake)}" if stake else ""
+        dash.chat("app", f"🎯 Batch — {len(accepted)} bet(s) it likes best{stake_txt}:\n{plan_lines}\n"
+                        f"walking you through them one at a time (YES sends / NO passes, 10-minute window each)."
+                        + ("\n" + refused_lines if refused_lines else ""))
+        self._advance_batch()
 
     def _stage_hunt(self, immediate: bool = False) -> None:
         """Run the all-market hunt and stage its pick for YES/NO. Never sends."""
@@ -1963,15 +2062,23 @@ class _Handler(BaseHTTPRequestHandler):
                                       f"{bet.get('count')} (IOC — unfilled remainder cancelled)\n"
                                       f"order id: {outcome.get('order_id') or '-'}\n"
                                       f"TOTAL FUNDS now: {funds_txt}")
+                            self._batch_outcome("filled",
+                                                f"{bet.get('ticker')} ({outcome.get('filled')}/{bet.get('count')} filled)")
                         else:
                             dash.chat("app", f"❌ Not sent — {outcome.get('error', 'unknown error')}")
+                            self._batch_outcome("refused",
+                                                f"{str((outcome.get('bet') or {}).get('ticker') or 'bet')} — {outcome.get('error', 'refused')}")
+                        self._advance_batch()
                     else:
                         dash.chat("app", "Nothing waiting for a YES — describe a bet first (type help).")
                 elif low in NO_WORDS:
                     if pending:
                         dash._chat_pending = None
-                        dash.pending_pop(pending)
+                        dropped = dash.pending_pop(pending)
                         dash.chat("app", "Cancelled — nothing was sent.")
+                        if dash._bet_batch is not None and dropped:
+                            self._batch_outcome("passed", str(dropped.get("ticker") or "bet"))
+                        self._advance_batch()
                     else:
                         dash.chat("app", "Nothing pending. (Yes, I know you hate confirmation pages.)")
                 else:

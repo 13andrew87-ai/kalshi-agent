@@ -154,10 +154,7 @@ class LLMClient:
                     "messages": [{"role": "user", "content": user}],
                 })
             else:  # OpenAI chat completions (groq/gemini/cerebras/openrouter/mistral/openai)
-                resp = http.post(self.base_url, timeout=45, headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "content-type": "application/json",
-                }, json={
+                body = {
                     "model": self.model,
                     "max_tokens": max_tokens,
                     "temperature": 0.2,
@@ -165,7 +162,14 @@ class LLMClient:
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},
                     ],
-                })
+                }
+                if self.provider in ("groq", "gemini"):
+                    # both guarantee valid-JSON content with this flag
+                    body["response_format"] = {"type": "json_object"}
+                resp = http.post(self.base_url, timeout=45, headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "content-type": "application/json",
+                }, json=body)
         except Exception as exc:  # noqa: BLE001
             log.error("LLM call to %s failed: %s", self.provider, exc)
             return None

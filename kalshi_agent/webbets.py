@@ -448,6 +448,7 @@ Rules, in priority order:
 5. If the request doesn't map to a real open market / held position, or is too vague, action must be "none" with a short, specific message naming what IS available.
 6. price_cents: integer 1-99, or null to take the current best ask (buys) / best bid (sells). Prefer null unless the user named a price.
 7. Reply with ONLY compact JSON: {{"action":"propose","order_side":"buy"|"sell","ticker":"...","side":"yes"|"no","count":N,"price_cents":null|N,"rationale":"one short sentence"}} or {{"action":"none","message":"..."}}
+8. If the request asks for MULTIPLE bets ("four 75 cent bets", "spread across the best markets", "make 3 bets"), reply with ONE object: {{"action":"multi","stake_cents":S,"note":"one short sentence","legs":[{{"order_side":"buy","ticker":"...","side":"yes"|"no","count":N,"price_cents":null,"rationale":"..."}}]}} where stake_cents is the per-bet budget named by the user (75 for "75 cent bets"; null if none). Choose legs ONLY from the OPEN MARKETS list, preferring the most likely-profitable (mispriced / asymmetric payout) tickets; one leg per ticker; legs MUST be buys. Keep each leg inside the stake budget (prefer null price). If fewer genuinely good legs exist than asked, return fewer and say so in note.
 Do not add commentary outside the JSON."""
 
 
@@ -495,6 +496,12 @@ def interpret_with_claude(prompt: str, *, catalog: list[dict[str, str]],
     obj = parse_llm_json(text)
     if not obj:
         return {"action": "none", "message": "model didn't return JSON — try ticket syntax"}
+    if obj.get("action") == "multi":
+        plan = _validate_multi_plan(obj, cfg=cfg, catalog=catalog)
+        if not plan["legs"]:
+            return {"action": "none",
+                    "message": "couldn't turn that into valid legs on the listed markets — try naming the markets, or fewer bets"}
+        return plan
     if obj.get("action") != "propose":
         return {"action": "none", "message": str(obj.get("message") or "not a bettable request")}
     order_side = str(obj.get("order_side") or obj.get("direction") or "buy").lower()
@@ -530,3 +537,47 @@ def interpret_with_claude(prompt: str, *, catalog: list[dict[str, str]],
                     "message": f"model proposed an unknown/untradable ticker {ticker!r} — rejected"}
     return {"action": "propose", "order_side": order_side, "ticker": ticker, "side": side,
             "count": count, "price_cents": price, "rationale": rationale}
+
+
+def _validate_multi_plan(obj: dict[str, Any], *, cfg: AppConfig, catalog: list[dict[str, str]]) -> dict[str, Any]:
+    """Validate a {action:'multi'} object from the model. Never raises."""
+    stake = obj.get("stake_cents")
+    try:
+        stake = int(stake) if stake is not None else None
+        if stake is not None and stake <= 0:
+            stake = None
+    except (TypeError, ValueError):
+        stake = None
+    note = str(obj.get("note") or "")[:200]
+    known = {str(m["ticker"]).upper() for m in catalog}
+    legs_out = []
+    seen = set()
+    for leg in (obj.get("legs") or [])[:8]:
+        if not isinstance(leg, dict):
+            continue
+        order_side = str(leg.get("order_side") or "buy").lower()
+        if order_side != "buy":            # multi mode is buys-only; sells stay one-at-a-time
+            continue
+        side = str(leg.get("side") or "").lower()
+        ticker = str(leg.get("ticker") or "").upper().strip()
+        if side not in ("yes", "no") or not _TICKER_RE.match(ticker):
+            continue
+        if ticker not in known or ticker in seen:
+            continue
+        seen.add(ticker)
+        try:
+            count = int(leg.get("count") or 1)
+        except (TypeError, ValueError):
+            count = 1
+        price = leg.get("price_cents", None)
+        try:
+            price = int(price) if price is not None else None
+        except (TypeError, ValueError):
+            price = None
+        if price is not None and not (1 <= price <= 99):
+            price = None
+        count = max(1, min(count, cfg.max_contracts_per_order))
+        legs_out.append({"order_side": "buy", "ticker": ticker, "side": side,
+                         "count": count, "price_cents": price,
+                         "rationale": str(leg.get("rationale") or "multi-bet leg")[:200]})
+    return {"action": "multi", "stake_cents": stake, "note": note, "legs": legs_out}
