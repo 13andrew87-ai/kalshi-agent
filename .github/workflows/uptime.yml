@@ -1,0 +1,23 @@
+# Keeps the always-on Fly machine warm + alerts on failure.
+# Hourly by design: the repo is private, so GitHub Actions minutes are capped
+# at 2,000/month; every-5-minutes would burn ~8,600. auto_stop_machines="off"
+# (fly.toml) is the primary defense; this is the free backstop.
+name: uptime
+on:
+  schedule:
+    - cron: '7 * * * *'   # hourly
+  workflow_dispatch: {}   # manual run from the Actions tab
+permissions: {}
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /healthz
+        run: |
+          echo "Pinging https://kalshi-agent-andrew.fly.dev/healthz"
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 30 https://kalshi-agent-andrew.fly.dev/healthz)
+          echo "healthz -> HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::Site/machine unhealthy (HTTP $code) — machine may be down"
+            exit 1
+          fi
