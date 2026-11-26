@@ -109,17 +109,35 @@ class Agent:
                         seen.add(t)
                         raw.append(d)
         else:
-            # Platform-wide hunt: pull a deep page of the raw listing (it is
-            # flooded with provisional combos), filter below, and keep the
-            # most liquid scan_limit survivors.
+            # Platform-wide hunt: deep pages from BOTH feeds (regular markets
+            # and multiplier/parlay combos), merged and filtered below. Combos
+            # are admitted only when they clear the same volume/liquidity
+            # floors — today ZERO combos trade, so they stay out automatically.
             raw = self.source.get_markets(status="open", limit=1000, max_pages=2,
                                           mve_filter="exclude")
+            if getattr(self.cfg, "allow_combo_markets", False):
+                try:
+                    raw += self.source.get_markets(status="open", limit=1000,
+                                                   max_pages=2, mve_filter="only")
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("combo feed fetch failed: %s — continuing with regular markets only", exc)
+            seen_tick: set[str] = set()
+            merged: list[dict] = []
+            for d in raw:
+                t = d.get("ticker")
+                if t and t not in seen_tick:
+                    seen_tick.add(t)
+                    merged.append(d)
+            raw = merged
 
         out = []
         now = datetime.now(timezone.utc)
         for d in raw:
             m = Market.from_api(d)
-            if m.status != "open" or m.is_provisional:
+            if m.status != "open":
+                continue
+            if m.is_provisional and not (getattr(self.cfg, "allow_combo_markets", False)
+                                         and (m.volume or 0) >= self.cfg.min_volume):
                 continue
             # require a real two-sided book: nobody quoting = nothing to trade
             if (m.yes_bid <= 0 and m.no_bid <= 0) or m.yes_ask >= 100:

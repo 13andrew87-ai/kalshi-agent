@@ -35,6 +35,9 @@ categories: []
 # All-market hunt (user decree 2026-11-26): empty watchlist => platform-wide scan,
 # provisional combo markets filtered out, ranked by volume, 8c edge bar unchanged.
 scan_limit: 60
+allow_combo_markets: true                   # user request 2026-11-26: multiplier/parlay (MVE) markets may be
+                                            # traded IF they pass the same volume/liquidity floors (as of today,
+                                            # zero combos have real volume — they stay out until one exists)
 series_watchlist: []                        # was: pinned to 8 sports series (NFL/NBA/NHL/soccer/Fed/props)
 min_liquidity_cents: 5000
 min_volume: 50

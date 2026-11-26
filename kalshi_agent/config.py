@@ -68,6 +68,7 @@ class AppConfig:
     series_watchlist: list[str] = field(default_factory=list)   # Kalshi series tickers;
     min_liquidity_cents: int = 10_000          # $100 of resting depth
     min_volume: int = 100
+    allow_combo_markets: bool = False          # multiplier/parlay (MVE) markets; only admitted if they pass the same volume/liquidity floors
     scan_limit: int = 200                      # max markets fetched per scan
 
     # --- predictor weights ---------------------------------------------------------

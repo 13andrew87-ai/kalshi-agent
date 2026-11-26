@@ -1783,7 +1783,9 @@ class _Handler(BaseHTTPRequestHandler):
         pub = KalshiClient(pub_cfg, signer=None)   # public endpoints only
         try:
             catalog = [{"ticker": c["ticker"], "title": c["title"]}
-                       for c in webbets.platform_catalog(pub, max_total=140)]
+                       for c in webbets.platform_catalog(pub, max_total=140,
+                                                         allow_combos=getattr(self.dashboard._live_cfg,
+                                                                              "allow_combo_markets", False))]
             if not catalog:  # platform scan failed — graceful degradation to watchlist
                 catalog = webbets.market_catalog(pub, list(cfg.series_watchlist or []),
                                                  per_series=20, max_total=140)

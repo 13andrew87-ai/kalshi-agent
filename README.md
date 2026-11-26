@@ -127,6 +127,14 @@ identical code path used live. Every fill, exit, block, and settlement is logged
 Exits (sells) bypass the exposure caps by design — **you must always be able to
 get out.** They still require the engine not be halted and the ticker allowed.
 
+### Combo (multiplier / parlay) markets — opt-in
+
+Since 2026-11-26, `allow_combo_markets: true` in `config-live.yaml` merges Kalshi's
+multivariate (MVE / parlay) feed into the agent scan and the web catalog. Honesty
+check: as of today **zero** combo markets trade (2,000 sampled: none clear the
+50-contract volume floor), so they contribute nothing yet — the same
+volume/liquidity/price-band floors apply, automatically. They enter the hunt the
+moment a real combo exists. Set the flag to `false` to exclude them entirely.
 ### All-market hunt (time-boxed, `maximize profits for N minutes`)
 
 Since 2026-11-26 the plain-English box is no longer pinned to the watchlist:

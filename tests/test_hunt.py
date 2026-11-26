@@ -127,3 +127,26 @@ def test_hunt_rejects_hallucinated_ticker(monkeypatch):
                                 positions=[], session=_GroqSession(bad))
     assert out["action"] == "none"
     assert "unknown ticker" in out["message"]
+
+
+# ------------------------------------------------------ combo (MVE) opt-in --
+def test_platform_catalog_combos_opt_in(monkeypatch):
+    rows = [
+        _mk("KXRAIN-CHEAP", ya=0.12, na=0.90, vol=500),
+        _mk("KXMVECROSSCATEGORY-S1-BABB", prov=True, ya=0.14, na=0.88, vol=777),
+        _mk("KXMVECROSSCATEGORY-S1-DEAD", prov=True, ya=0.15, na=0.87, vol=0),
+    ]
+
+    class _ComboClient:
+        def get_markets(self, status="open", limit=1000, max_pages=2, mve_filter=None, **kw):
+            return [r for r in rows if (r.get("is_provisional") == (mve_filter == "only"))]
+
+    # combos OFF (default): regular feed only, provisional never admitted
+    cat = webbets.platform_catalog(_ComboClient(), max_total=10, allow_combos=False)
+    assert [c["ticker"] for c in cat] == ["KXRAIN-CHEAP"]
+    # combos ON: liquid combo admitted, dead combo still out
+    cat = webbets.platform_catalog(_ComboClient(), max_total=10, allow_combos=True)
+    tickers = [c["ticker"] for c in cat]
+    assert "KXMVECROSSCATEGORY-S1-BABB" in tickers
+    assert "KXMVECROSSCATEGORY-S1-DEAD" not in tickers
+    assert "KXRAIN-CHEAP" in tickers

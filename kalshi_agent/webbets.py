@@ -309,26 +309,47 @@ def load_live_cfg(path: str | None = None) -> tuple[AppConfig, bool]:
 
 
 # --------------------------------------------------------- market catalog ---
-def platform_catalog(client: Any, max_total: int = 160) -> list[dict[str, Any]]:
+def platform_catalog(client: Any, max_total: int = 160, *,
+                     allow_combos: bool = False,
+                     min_volume: int = 50) -> list[dict[str, Any]]:
     """Top liquid OPEN markets across the whole exchange (not just watchlist).
 
     Used when the user decrees an all-market hunt. Cheap-side filter: keeps only
     markets with at least one side inside the [8c, 30c] band, so suggestions are
     actually actionable under config-live.yaml. Sorted by volume, most liquid
-    first. Never raises — network failure returns []."""
+    first. Multiplier/parlay (MVE) markets are merged in only when allow_combos
+    is on AND they clear the same volume floor — today none do. Never raises —
+    network failure returns []."""
+    rows: list[dict[str, Any]] = []
     try:
-        rows = client.get_markets(status="open", limit=1000, max_pages=2,
-                                  mve_filter="exclude")
+        rows += client.get_markets(status="open", limit=1000, max_pages=2,
+                                   mve_filter="exclude")
     except Exception as exc:  # noqa: BLE001
-        log.warning("platform catalog fetch failed: %s", exc)
-        return []
-    out: list[dict[str, Any]] = []
+        log.warning("platform catalog fetch (regular) failed: %s", exc)
+    if allow_combos:
+        try:
+            rows += client.get_markets(status="open", limit=1000, max_pages=2,
+                                       mve_filter="only")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("platform catalog fetch (combos) failed: %s", exc)
+    seen_tick: set[str] = set()
+    merged: list[dict[str, Any]] = []
     for d in rows:
+        t = str(d.get("ticker") or "")
+        if t and t not in seen_tick:
+            seen_tick.add(t)
+            merged.append(d)
+    out: list[dict[str, Any]] = []
+    for d in merged:
         try:
             m = Market.from_api(d)
         except Exception:  # noqa: BLE001
             continue
-        if m.status != "open" or m.is_provisional:
+        if m.status != "open":
+            continue
+        if m.is_provisional and not (allow_combos and (m.volume or 0) >= min_volume):
+            continue
+        if (m.volume or 0) < min_volume:
             continue
         cheap = min(m.yes_ask if m.yes_ask > 0 else 101,
                     m.no_ask if m.no_ask > 0 else 101)
@@ -364,12 +385,13 @@ def hunt_best_bet(client: Any, *, cfg: AppConfig, balance_cents: int,
 
     Returns the same shape as interpret_with_claude so the staging path is
     shared. Never places an order. `client` is the market-data (public) client."""
+    allow_combos = getattr(cfg, "allow_combo_markets", False)
     llm = _llm.LLMClient(session=session)
     if not llm.configured:
         return {"action": "none",
                 "message": "hunt needs an AI key on the server — add a FREE one: "
                            "fly secrets set GROQ_API_KEY=... (console.groq.com, free)"}
-    cat = platform_catalog(client, max_total=140)
+    cat = platform_catalog(client, max_total=140, allow_combos=allow_combos)
     if not cat:
         return {"action": "none",
                 "message": "couldn't scan open markets right now (network) — try again in a minute"}
