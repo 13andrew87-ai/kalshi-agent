@@ -11,9 +11,9 @@ kelly_fraction: 1.0          # full Kelly on a $3 bankroll still rounds to ~1 co
 min_edge_cents: 8            # demand a fat edge to justify a concentrated clip
 max_price_cents: 30          # only cheap contracts: max ~30c risk per contract
 max_contracts_per_order: 2
-max_pct_bankroll_per_market: 50.0
-max_total_exposure_pct: 50.0
-max_open_positions: 4
+max_pct_bankroll_per_market: 50.0   # per-market stays at 50% (user decision 2026-11-26)
+max_total_exposure_pct: 100.0       # raised 50 -> 100 (user request 2026-11-26): full deploy allowed
+max_open_positions: 8               # raised 4 -> 8 (user request 2026-11-26)
 daily_loss_limit_pct: 15.0   # $0.45 on $3 — halts the day after ~1.5 losing clips
 min_cash_reserve_pct: 10.0
 
