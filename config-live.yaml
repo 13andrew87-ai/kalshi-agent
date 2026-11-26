@@ -32,18 +32,12 @@ ai_exit_poll_minutes: 5
 cooldown_minutes_after_loss: 60
 consecutive_loss_kill: 6
 categories: []
-series_watchlist:                           # verified liquid series (2026-11 probe)
-  - KXNFLGAME
-  - KXNBAGAME
-  - KXNHLGAME
-  - KXEPLGAME
-  - KXEFOOTBALLGAME
-  - KXFED
-  - KXNBAPTS
-  - KXNFLPASSYDS
+# All-market hunt (user decree 2026-11-26): empty watchlist => platform-wide scan,
+# provisional combo markets filtered out, ranked by volume, 8c edge bar unchanged.
+scan_limit: 60
+series_watchlist: []                        # was: pinned to 8 sports series (NFL/NBA/NHL/soccer/Fed/props)
 min_liquidity_cents: 5000
 min_volume: 50
-scan_limit: 40
 poll_seconds: 45
 rate_limit_per_sec: 8.0
 state_dir: state

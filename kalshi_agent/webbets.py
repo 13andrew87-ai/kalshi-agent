@@ -38,6 +38,7 @@ from typing import Any
 
 from . import llm as _llm
 from .config import AppConfig
+from .models import Market
 
 LIVE_CFG_PATH = os.environ.get("KALSHI_LIVE_CONFIG", "config-live.yaml")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")  # retained for back-compat
@@ -308,6 +309,109 @@ def load_live_cfg(path: str | None = None) -> tuple[AppConfig, bool]:
 
 
 # --------------------------------------------------------- market catalog ---
+def platform_catalog(client: Any, max_total: int = 160) -> list[dict[str, Any]]:
+    """Top liquid OPEN markets across the whole exchange (not just watchlist).
+
+    Used when the user decrees an all-market hunt. Cheap-side filter: keeps only
+    markets with at least one side inside the [8c, 30c] band, so suggestions are
+    actually actionable under config-live.yaml. Sorted by volume, most liquid
+    first. Never raises — network failure returns []."""
+    try:
+        rows = client.get_markets(status="open", limit=1000, max_pages=2)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("platform catalog fetch failed: %s", exc)
+        return []
+    out: list[dict[str, Any]] = []
+    for d in rows:
+        try:
+            m = Market.from_api(d)
+        except Exception:  # noqa: BLE001
+            continue
+        if m.status != "open" or m.is_provisional:
+            continue
+        cheap = min(m.yes_ask if m.yes_ask > 0 else 101,
+                    m.no_ask if m.no_ask > 0 else 101)
+        if cheap < 8 or cheap > 30:
+            continue
+        title = (m.title or m.subtitle or "").strip()
+        if not title:
+            continue
+        out.append({"ticker": m.ticker, "title": title[:80],
+                    "yes_ask": m.yes_ask, "no_ask": m.no_ask,
+                    "yes_bid": m.yes_bid, "no_bid": m.no_bid,
+                    "volume": m.volume or 0})
+    out.sort(key=lambda c: -int(c.get("volume") or 0))
+    return out[:max_total]
+
+
+_HUNT_SYSTEM = """You are an aggressive but disciplined Kalshi hunt engine with a TINY bankroll.
+Pick exactly ONE bet from the candidate list that offers the best risk-adjusted profit.
+Rules, in priority order:
+1. ONLY name tickers from the CANDIDATES list. Never invent tickers or prices.
+2. Side: buy "yes" if the event is more likely than the price implies, else buy "no".
+3. Size is 1-{max_contracts} contracts. Price must sit inside the candidate's ask.
+4. Think like a bettor: mispriced probabilities, asymmetric payouts, late-but-live underdogs. Avoid coin-flip favorites at long prices; prefer concrete edges.
+5. You may also choose to PASS if nothing is genuinely mispriced — then action must be "none".
+6. Reply with ONLY compact JSON, nothing else: {{"action":"propose","ticker":"...","side":"yes"|"no","count":N,"price_cents":null|N,"rationale":"one punchy sentence"}} or {{"action":"none","message":"one specific sentence on why you passed"}}
+"""
+
+
+def hunt_best_bet(client: Any, *, cfg: AppConfig, balance_cents: int,
+                  positions: list[dict[str, Any]] | None = None,
+                  session: Any = None) -> dict[str, Any]:
+    """All-market hunt: pick ONE mispriced ticket across the board (any series).
+
+    Returns the same shape as interpret_with_claude so the staging path is
+    shared. Never places an order. `client` is the market-data (public) client."""
+    llm = _llm.LLMClient(session=session)
+    if not llm.configured:
+        return {"action": "none",
+                "message": "hunt needs an AI key on the server — add a FREE one: "
+                           "fly secrets set GROQ_API_KEY=... (console.groq.com, free)"}
+    cat = platform_catalog(client, max_total=140)
+    if not cat:
+        return {"action": "none",
+                "message": "couldn't scan open markets right now (network) — try again in a minute"}
+    held = held_positions_summary(positions)
+    positions_txt = positions_catalog(held)
+    cat_txt = "\n".join(
+        f"{c['ticker']} | {c['title']} | yes_ask {c['yes_ask']}c | no_ask {c['no_ask']}c | vol {c['volume']}"
+        for c in cat)
+    sys_p = _HUNT_SYSTEM.format(max_contracts=cfg.max_contracts_per_order)
+    user_msg = (f"BALANCE: {balance_cents}c available\nOPEN POSITIONS:\n{positions_txt}\n\n"
+                f"CANDIDATES (top liquid open markets, any series):\n{cat_txt}\n")
+    text = llm.complete(system=sys_p, user=user_msg, max_tokens=300)
+    if text is None:
+        return {"action": "none", "message": f"{llm.provider} AI call failed — hunt again shortly or type a bet"}
+    obj = parse_llm_json(text)
+    if not obj:
+        return {"action": "none", "message": "hunt model didn't return JSON — try again or type a bet"}
+    if obj.get("action") != "propose":
+        return {"action": "none", "message": str(obj.get("message") or "passed on the board — no mispricing worth the bankroll")}
+    ticker = str(obj.get("ticker") or "").upper().strip()
+    side = str(obj.get("side") or "").lower()
+    try:
+        count = int(obj.get("count") or 1)
+    except (TypeError, ValueError):
+        count = 1
+    price = obj.get("price_cents", None)
+    try:
+        price = int(price) if price is not None else None
+    except (TypeError, ValueError):
+        price = None
+    if not _TICKER_RE.match(ticker):
+        return {"action": "none", "message": "hunt proposed a malformed ticker — pass discarded"}
+    if side not in ("yes", "no"):
+        return {"action": "none", "message": "hunt proposed an invalid side — pass discarded"}
+    known = {c["ticker"] for c in cat}
+    if ticker not in known:
+        return {"action": "none", "message": f"hunt proposed an unknown ticker {ticker!r} — pass discarded"}
+    count = max(1, min(count, cfg.max_contracts_per_order))
+    return {"action": "propose", "order_side": "buy", "ticker": ticker, "side": side,
+            "count": count, "price_cents": price,
+            "rationale": str(obj.get("rationale") or "hunt pick")[:200]}
+
+
 def market_catalog(client: Any, series_list: list[str], per_series: int = 25,
                    max_total: int = 150) -> list[dict[str, str]]:
     """Compact list of currently-open markets for grounding the LLM.

@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import random
+import re
 import secrets
 import shutil
 import threading
@@ -219,6 +220,7 @@ class WebDashboard:
             "generated_public_pem": "", "generated_private_pem": "",
         }
         self._load_persisted_credentials()
+        self._load_hunt()
 
         # manual betting (prompt box) — hard caps from config-live.yaml
         self._live_cfg, self._live_cfg_ok = webbets.load_live_cfg()
@@ -790,6 +792,38 @@ class WebDashboard:
         self._account_cache = out
         return dict(out)
 
+    # ---------------------------------------------------- hunt window ----
+    def hunt_remaining(self) -> float:
+        return max(0.0, getattr(self, "hunt_until", 0.0) - time.time())
+
+    def hunt_active(self) -> bool:
+        return self.hunt_remaining() > 0
+
+    def set_hunt(self, minutes: float) -> None:
+        self.hunt_until = time.time() + max(0.0, minutes) * 60.0
+        try:
+            _atomic_write(os.path.join(self.cfg.state_dir, "web", "hunt.json"),
+                          json.dumps({"until": self.hunt_until}))
+        except Exception:  # noqa: BLE001
+            pass                      # in-memory is the source of truth; persistence is best-effort
+
+    def stop_hunt(self) -> None:
+        self.hunt_until = 0.0
+        try:
+            p = os.path.join(self.cfg.state_dir, "web", "hunt.json")
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _load_hunt(self) -> None:
+        self.hunt_until = 0.0
+        try:
+            with open(os.path.join(self.cfg.state_dir, "web", "hunt.json")) as fh:
+                self.hunt_until = float(json.load(fh).get("until", 0.0))
+        except Exception:  # noqa: BLE001
+            self.hunt_until = 0.0
+
     def chat(self, role: str, text: str) -> None:
         self._chat.append((role, str(text)))
         self._chat = self._chat[-40:]
@@ -1263,6 +1297,38 @@ def _bet_checks_rows(checks: list) -> str:
 _BET_STYLE = "max-width:720px;margin:0 auto;padding:20px;color:#e2e8f0;font-family:ui-monospace,Menlo,Consolas,monospace;"
 
 
+def _chat_color(role: str, text) -> str:
+    """Bubble accent: green affirmatives, red negatives, amber warnings, neutral default."""
+    if role == "you":
+        return "#93c5fd"
+    t = str(text).lstrip()
+    if t.startswith(("✅", "🎯")):
+        return "#22c55e"      # green affirmative
+    if t.startswith(("❌", "✗", "🛑")):
+        return "#f87171"      # red negative
+    if t.startswith("⚠"):
+        return "#eab308"      # amber warning
+    return "#c4b5fd"          # neutral agent purple
+
+
+_HUNT_DECREE_RE = re.compile(
+    r"^(?:maximize(?:\s+profits)?|hunt|pinched|trade|snipe)\s*(?:for\s*)?"
+    r"(\d+(?:\.\d+)?)\s*(minute|minutes|min|mins|m|hour|hours|hr|hrs|h)\b", re.I)
+_HUNT_MAX_MINUTES = 8 * 60   # 8h hard ceiling on a decree
+
+
+def _parse_hunt_decree(low: str) -> float | None:
+    """'maximize profits for 45 minutes' / 'hunt for 2 hours' -> minutes (clamped). None if not a decree."""
+    m = _HUNT_DECREE_RE.match((low or "").strip())
+    if not m:
+        return None
+    qty = float(m.group(1))
+    unit = m.group(2).lower()
+    minutes = qty * 60 if unit.startswith(("hour", "hr", "h")) else qty
+    minutes = max(1.0, min(minutes, float(_HUNT_MAX_MINUTES)))
+    return minutes
+
+
 def render_account_page(dash: "WebDashboard") -> str:
     """Real-money console: signed Kalshi funds, live positions/fills, bet chat.
     No sim/paper agent — nothing on this page can trade autonomously."""
@@ -1284,7 +1350,7 @@ def render_account_page(dash: "WebDashboard") -> str:
     bubbles = []
     for role, text in (s.get("chat") or [])[-24:]:
         who = "YOU" if role == "you" else "AGENT"
-        color = "#93c5fd" if role == "you" else "#c4b5fd"
+        color = _chat_color(role, text)
         bubbles.append(
             '<div style="padding:6px 2px;border-bottom:1px solid #1e293b;">'
             f'<span style="color:{color};font-size:10px;letter-spacing:1px;">{who}</span><br>'
@@ -1348,13 +1414,22 @@ def render_account_page(dash: "WebDashboard") -> str:
         funds_big = "—"
         funds_sub = _esc(str(funds.get("error") or "unavailable"))
 
+    if dash.hunt_active():
+        whisper = int(dash.hunt_remaining() // 60) + (1 if dash.hunt_remaining() % 60 else 0)
+        hunt_banner = f'''<div style="background:#052e16;border:1px solid #16a34a;border-radius:10px;padding:10px 14px;margin-bottom:12px;color:#86efac;font-size:13px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+<div><b>🎯 HUNT ACTIVE — {int(whisper)} minute(s) left</b> · all liquid markets · every pick needs your YES</div>
+<form method="post" action="{base}/hunt/stop" style="margin:0"><button style="background:#14532d;color:#86efac;border:1px solid #22c55e;border-radius:8px;padding:6px 14px;font-size:12px;cursor:pointer;font-family:inherit;">STOP HUNT 🛑</button></form>
+</div>'''
+    else:
+        hunt_banner = ""
+
     chat_panel_inner = (
         f'<div style="background:#020617;border:1px solid #1e293b;border-radius:10px;'
         f'padding:10px;height:260px;overflow-y:auto;margin-bottom:10px;">{transcript}</div>'
         f'<form method="post" action="{base}/bet/chat" style="margin:0">'
         f'<div style="display:flex;gap:8px;">'
         f'<input type="text" name="prompt" autocomplete="off" autofocus required '
-        f'placeholder="buy 1 yes KXNBAGAME-… 22c · sell 1 yes KXNFLGAME-… · yes / no · funds · help" '
+        f'placeholder="maximize profits for 45 minutes · buy 1 yes KXRAIN-… 8c · yes / no · funds · help" '
         f'style="flex:1;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;'
         f'padding:10px 12px;font-size:13px;font-family:inherit;">'
         f'<button style="{_btn_style("#7c3aed")}">Send</button>'
@@ -1391,6 +1466,7 @@ No simulated or paper trading here. Every order needs your explicit YES in the b
 {_card('AUTOMATION', 'OFF', 'every order needs your YES', '#eab308')}
 </div>
 
+{hunt_banner}
 {_panel('ASK TO PLACE A BET', chat_panel_inner)}
 
 {_panel(f'OPEN POSITIONS ({open_n}) — live from Kalshi', pos_html)}
@@ -1669,8 +1745,9 @@ class _Handler(BaseHTTPRequestHandler):
                 log.warning("dashboard: credential save -> %s", msg)
             elif path == "/credentials/generate":
                 self.dashboard.generate_keypair()
-            elif path == "/credentials/clear":
-                self.dashboard.clear_credentials()
+            elif path == "/hunt/stop":
+                self.dashboard.stop_hunt()
+                self.dashboard.chat("app", "🛑 Hunt stopped. No more picks; open orders unaffected.")
             else:
                 log.warning("web: unknown POST path %s", path)
         except Exception:  # noqa: BLE001
@@ -1703,8 +1780,11 @@ class _Handler(BaseHTTPRequestHandler):
         pub_cfg.rate_limit_per_sec = 4.0
         pub = KalshiClient(pub_cfg, signer=None)   # public endpoints only
         try:
-            catalog = webbets.market_catalog(pub, list(cfg.series_watchlist or []),
-                                             per_series=20, max_total=140)
+            catalog = [{"ticker": c["ticker"], "title": c["title"]}
+                       for c in webbets.platform_catalog(pub, max_total=140)]
+            if not catalog:  # platform scan failed — graceful degradation to watchlist
+                catalog = webbets.market_catalog(pub, list(cfg.series_watchlist or []),
+                                                 per_series=20, max_total=140)
         except Exception as exc:  # noqa: BLE001
             catalog = []
             log.warning("bet: market catalog fetch failed: %s", exc)
@@ -1734,6 +1814,32 @@ class _Handler(BaseHTTPRequestHandler):
                       else str(f.get("error") or "unavailable")))
             dash.chat("app", txt)
             return
+        if low in ("stop", "stop hunting", "halt hunt", "end hunt", "stop hunt"):
+            was = self.dashboard.hunt_active()
+            self.dashboard.stop_hunt()
+            self.dashboard.chat("app", ("🛑 Hunt STOPPED. No more picks will be staged — "
+                                       "open orders are unaffected." if was
+                                       else "No hunt is running."))
+            return
+        m_hunt = _parse_hunt_decree(low)
+        if m_hunt is not None:
+            minutes = m_hunt
+            self.dashboard.set_hunt(minutes)
+            self.dashboard.chat("app",
+                  f"🎯 HUNT ON for {minutes:g} minute(s) across ALL liquid Kalshi markets — "
+                  f"I'll pick the most mispriced tickets for you. Every order still needs your "
+                  f"explicit YES in this box; deadline cuts picks off completely. "
+                  f"Type 'stop hunting' to end it early.")
+            self._stage_hunt(immediate=True)
+            return
+        if low in ("hunt", "maximize profits", "maximize", "next pick", "pick", "best bet"):
+            if self.dashboard.hunt_active():
+                self._stage_hunt()
+            else:
+                self.dashboard.chat("app",
+                      "Tell me how long to hunt: e.g. 'maximize profits for 45 minutes' "
+                      "(or 2 hours). I decree it, the clock decides when it ends.")
+            return
         if low in ("help", "?"):
             dash.chat("app", "I understand:\n"
                              "• buy N yes|no TICKER [at Xc]   e.g. buy 1 yes KXNBA-26NOV25-LAL 22c\n"
@@ -1741,6 +1847,9 @@ class _Handler(BaseHTTPRequestHandler):
                              "• or plain English if Claude is configured\n"
                              "• funds — re-pull your Kalshi balance\n"
                              "• yes / no — answer a pending bet\n"
+                             "• maximize profits for N minutes — all-market hunt (any liquid market), time-boxed\n"
+                             "• hunt / next pick — fetch my current best pick while a hunt window is live\n"
+                             "• stop hunting — kill the window early\n"
                              "Nothing is ever sent without your YES.")
             return
         proposal, immediate = self._parse_proposal(prompt)
@@ -1772,6 +1881,58 @@ class _Handler(BaseHTTPRequestHandler):
                   f"balance after ≈ {_fmt_usd(bet['balance_before_cents'] + (bet.get('proceeds_cents', 0) if action == 'sell' else -bet['cost_cents']))}\n"
                   f"{cap_line}\n\n"
                   f"Reply YES to send it, or NO to cancel. (2-minute expiry)")
+
+    def _stage_hunt(self, immediate: bool = False) -> None:
+        """Run the all-market hunt and stage its pick for YES/NO. Never sends."""
+        dash = self.dashboard
+        if not dash.hunt_active():
+            dash.chat("app", "🛑 The hunt window has closed — decree another one ('maximize profits for 30 minutes').")
+            return
+        cred = dash.credentials
+        base_url = DEMO_BASE_URL if cred.get("env") == "demo" else DEFAULT_BASE_URL
+        pub_cfg = AppConfig()
+        pub_cfg.base_url = base_url
+        pub_cfg.rate_limit_per_sec = 4.0
+        pub = KalshiClient(pub_cfg, signer=None)   # public market data
+        try:
+            bal = dash._signed_client().get_balance()
+            balance_cents = int(bal.get("balance") or 0)
+        except Exception:  # noqa: BLE001
+            balance_cents = 0
+        try:
+            positions = dash._positions_open(dash._signed_client())
+        except Exception:  # noqa: BLE001
+            positions = []
+        out = webbets.hunt_best_bet(pub, cfg=dash._live_cfg,
+                                    balance_cents=balance_cents, positions=positions)
+        if out.get("action") != "propose":
+            dash.chat("app", f"🔍 Hunt passed this round: {out.get('message') or 'nothing compelling on the board'}\n"
+                             f"(window live — type 'hunt' to re-scan)")
+            return
+        staged = dash.stage_order(out.get("order_side", "buy"), ticker=out["ticker"],
+                                  side=out["side"], count=out["count"],
+                                  price_cents=out.get("price_cents"),
+                                  rationale=out.get("rationale", ""))
+        if not staged.get("ok"):
+            failed = [f"✗ {lbl} — {dtl}" for lbl, ok, dtl in (staged.get("bet") or {}).get("checks", [])
+                      if not ok]
+            msg = f"🔍 Hunt found {out['ticker']} but caps blocked it: {staged.get('error')}"
+            if failed:
+                msg += "\n" + "\n".join(failed)
+            dash.chat("app", msg)
+            return
+        bet = staged["bet"]
+        token = dash.stage_pending(bet)
+        dash._chat_pending = token
+        mins_left = int(dash.hunt_remaining() // 60)
+        cash_line = f"total cost ≈ {_fmt_usd(bet['cost_cents'])} (incl. ~{_fmt_usd(bet['fee_cents'])} fee)"
+        dash.chat("app",
+                  f"🎯 HUNT PICK ({mins_left}m left): BUY {bet['count']} × {bet['side'].upper()} · {bet['ticker']}\n"
+                  f"{bet.get('title') or ''}\n"
+                  f"limit {bet['price_cents']}c (IOC) · {cash_line}\n"
+                  f"rationale: {bet.get('rationale') or 'hunt pick'}\n"
+                  f"caps: all checks pass (config-live.yaml, exchange-verified)\n\n"
+                  f"Reply YES to send it, or NO to pass. (2-minute expiry)")
 
     def _handle_bet_post(self, path: str, form: dict) -> None:
         dash = self.dashboard

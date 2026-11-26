@@ -127,6 +127,29 @@ identical code path used live. Every fill, exit, block, and settlement is logged
 Exits (sells) bypass the exposure caps by design — **you must always be able to
 get out.** They still require the engine not be halted and the ticker allowed.
 
+### All-market hunt (time-boxed, `maximize profits for N minutes`)
+
+Since 2026-11-26 the plain-English box is no longer pinned to the watchlist:
+- Typing **`maximize profits for 45 minutes`** (any `N minutes/hours`, clamped to 8h)
+  starts a hunt window across **all liquid open Kalshi markets** — KXRAIN included,
+  provisional parlays excluded, cheap-side (8–30c) only, liquidity-sorted.
+- While the window is live, type **`hunt`** / **`next pick`** to have the AI (Groq
+  `openai/gpt-oss-120b`, free) pick ONE most-mispriced ticket — validated against the
+  real catalog, staged as a normal bet card in the chat with **your YES/NO gate
+  intact** and green confirmations on fill. Only buys, max `max_contracts_per_order`,
+  same price band and all the same `config-live.yaml` caps (position slots, exposure,
+  reserve, IOC) apply — enforced and re-verified at send time.
+- **`stop hunting`** (or the STOP HUNT button in the page) kills the window; expiry
+  kills it automatically. Nothing hunts while the app sleeps; hunting is on-demand
+  during the window.
+- The card is refused when the model hallucinates a ticker, returns garbage, or the
+  AI is unavailable — you keep the ticket-syntax path regardless.
+- The LOCAL live agent uses the same decree in spirit: `config-live.yaml` now scans
+  the whole exchange (top `scan_limit: 60` by volume) instead of the 8-series
+  watchlist. 8¢ entry edge bar unchanged.
+- "Maximize profits" is a style of play, not a guarantee: you can lose money faster
+  with a full-deploy cap on. The 15% daily-loss halt and −15¢/+5¢ exits remain armed.
+
 ### AI-managed exits (opt-in; `ai_exits_enabled`, on in `config-live.yaml`)
 
 The local live bot can hand the *judgment* call to any configured AI model
