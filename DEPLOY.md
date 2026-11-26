@@ -117,3 +117,53 @@ Review them before arming. **Simulated performance is not a promise of profit.**
 - **Health**: `GET /healthz` → `ok` (unauthenticated, for load balancers)
 - **Backup**: snapshot the `state` volume (it holds the encrypted-at-rest
   material for the account you configure); treat it like a secret.
+
+## Fly.io production (kalshi-agent-andrew) — what actually runs
+
+Single always-on machine (`min_machines_running = 1`, shared-cpu-1x, 512MB) in
+`lax`, volume `kalshi_state` mounted at `/app/state` (survives restarts).
+
+The image entrypoint (`fly-entrypoint.sh`) starts TWO processes on that one
+machine — never two machines, never two agents:
+
+1. **Live trading agent** — `python -m kalshi_agent.cli --config config-live.yaml live --live`
+   under a watchdog loop (crash → restart after 5s). It ARMS ITSELF ONLY if the
+   Kalshi credentials exist on the volume (`/app/state/web/credentials/`, the
+   same PEM + key id saved via the account console's API-keys page; key id is
+   read from `meta.json`, never from a pasted chat value). `KALSHI_LIVE_CONFIRM=YES`
+   is set inside the entrypoint. Agent stdout → `/app/state/live/agent-stdout.log`.
+2. **Account console (web)** — main process; unchanged YES-gated manual betting.
+
+**This machine trades real money autonomously** under the same rules as the old
+local agent: 8¢ edge bar, 8–30¢ band, 2 contracts max, hard −15¢ stop / +5¢ TP,
+50% per-market, 8 positions / 100% exposure caps, AI exits via free Groq. The
+prompt box on the site still requires an explicit YES tap per bet — including
+each leg of a multi-bet batch.
+
+### Deploys
+
+Use **`flyctl deploy --strategy immediate`**. The default `rolling` strategy
+puts the machine into `stopped` state and leaves the site down until manually
+started; `immediate` replaces it in place and it comes back on its own (~15s,
+health check flips to passing). Every deploy reboots the machine: the live
+agent pauses ~15–30s mid-cycle; in-flight IOC orders are atomic at the
+exchange, and state is rebuilt from the exchange next cycle — nothing else to
+care about. Same image, one reboot, no duplicates.
+
+- Health: `curl https://kalshi-agent-andrew.fly.dev/healthz` → `ok`
+- Agent log: `flyctl ssh console -a kalshi-agent-andrew -C "tail -20 /app/state/live/agent-stdout.log"`
+- Machine state: `flyctl machine list -a kalshi-agent-andrew`
+- Fly secrets hold only `KALSHI_API_KEY_ID` (fallback); no PEM, no PATs, nothing
+  else. The Groq key is read from `/app/state/groq_api_key` if present — set it
+  once via ssh if AI exits are wanted (it is; they're on in config-live.yaml).
+
+### Known operational truths
+
+- The Kalshi **v2 order endpoints** are mandatory (`POST /trade-api/v2/portfolio/events/orders`,
+  `DELETE .../orders/{id}`; payload is YES-leg single-book `bid`/`ask` with
+  fixed-point dollar prices — buy NO is encoded as ask YES at `1 - price`). Legacy
+  `/portfolio/orders` returns `410 deprecated_v1_order_endpoint`.
+- If the volume has no credentials, the agent does NOT arm; the console still
+  serves and logs "credentials missing on volume — live agent DISABLED".
+- Sandbox (Arena) sessions die with every bounce; the Fly machine is the
+  permanent home. Do NOT run a second agent against the same account anywhere.
