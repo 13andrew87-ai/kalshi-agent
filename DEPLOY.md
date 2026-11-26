@@ -167,3 +167,22 @@ care about. Same image, one reboot, no duplicates.
   serves and logs "credentials missing on volume — live agent DISABLED".
 - Sandbox (Arena) sessions die with every bounce; the Fly machine is the
   permanent home. Do NOT run a second agent against the same account anywhere.
+
+## Fly machine ops (post-2026-11-26 fixes)
+
+- Machine restart policy: **`always`** (`flyctl machine update <id> --restart always`).
+  Without it, a clean SIGINT (exit 0) left the machine stopped — deploys did not
+  auto-restart it (on-failure default). Now deploys/reboots self-heal.
+- `auto_stop_machines = "off"`, `min_machines_running = 1` — never idle-stop.
+- `--strategy immediate` for deploys; even so, verify afterwards:
+  `flyctl machine list -a kalshi-agent-andrew` → expect `started`, 1/1 checks;
+  `curl /healthz` → `ok`. If stopped, HTTP probe auto-starts it (auto_start=true).
+- **Pause the live agent intentionally** (without stopping the console):
+  `flyctl ssh console -a kalshi-agent-andrew -C "pkill -f 'kalshi_agent.cli.*live'"`.
+  The watchdog would otherwise restart it in 5s — kill BOTH the watchdog subshell
+  and the python process, or use `--restart on-failure` before stopping.
+- Live position reconciliation: Kalshi terminal statuses `determined`/`finalized`
+  are normalized to `settled` in Market.from_api (fix 2026-11-26); a held market
+  that finalized is settled on the next agent cycle from `get_market` — no open
+  position on the exchange means the mirror must not hold it either.
+  Lost basis is written off via Portfolio.settle with `why="settlement"`.
