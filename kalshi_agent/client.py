@@ -132,6 +132,7 @@ class KalshiClient:
         max_pages: int = 5,
         event_ticker: str | None = None,
         series_ticker: str | None = None,
+        mve_filter: str | None = None,
     ) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         cursor: str | None = None
@@ -143,6 +144,8 @@ class KalshiClient:
                 params["event_ticker"] = event_ticker
             if series_ticker:
                 params["series_ticker"] = series_ticker
+            if mve_filter:
+                params["mve_filter"] = mve_filter
             data = self.request("GET", "/markets", params=params)
             out.extend(data.get("markets", []))
             cursor = data.get("cursor")

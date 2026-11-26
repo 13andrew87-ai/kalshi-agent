@@ -317,7 +317,8 @@ def platform_catalog(client: Any, max_total: int = 160) -> list[dict[str, Any]]:
     actually actionable under config-live.yaml. Sorted by volume, most liquid
     first. Never raises — network failure returns []."""
     try:
-        rows = client.get_markets(status="open", limit=1000, max_pages=2)
+        rows = client.get_markets(status="open", limit=1000, max_pages=2,
+                                  mve_filter="exclude")
     except Exception as exc:  # noqa: BLE001
         log.warning("platform catalog fetch failed: %s", exc)
         return []

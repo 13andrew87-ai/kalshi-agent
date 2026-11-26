@@ -109,7 +109,11 @@ class Agent:
                         seen.add(t)
                         raw.append(d)
         else:
-            raw = self.source.get_markets(status="open", limit=self.cfg.scan_limit)
+            # Platform-wide hunt: pull a deep page of the raw listing (it is
+            # flooded with provisional combos), filter below, and keep the
+            # most liquid scan_limit survivors.
+            raw = self.source.get_markets(status="open", limit=1000, max_pages=2,
+                                          mve_filter="exclude")
 
         out = []
         now = datetime.now(timezone.utc)
