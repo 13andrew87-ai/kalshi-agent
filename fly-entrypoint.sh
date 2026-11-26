@@ -9,9 +9,14 @@ set -u
 mkdir -p /app/state/live
 
 CRED_DIR=/app/state/web/credentials
-KEY_ID="${KALSHI_API_KEY_ID:-}"
-if [ -z "$KEY_ID" ] && [ -f "$CRED_DIR/meta.json" ]; then
+# The volume's meta.json is the validated credential the console uses — prefer it
+# over any possibly-stale KALSHI_API_KEY_ID secret left over from an older key.
+KEY_ID=""
+if [ -f "$CRED_DIR/meta.json" ]; then
   KEY_ID=$(python3 -c "import json;print(json.load(open('$CRED_DIR/meta.json')).get('key_id',''))" 2>/dev/null || true)
+fi
+if [ -z "$KEY_ID" ]; then
+  KEY_ID="${KALSHI_API_KEY_ID:-}"
 fi
 
 if [ -n "$KEY_ID" ] && [ -f "$CRED_DIR/kalshi_private_key.pem" ]; then
