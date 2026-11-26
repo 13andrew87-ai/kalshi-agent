@@ -18,11 +18,11 @@ primary_region = "lax"   # Los Angeles — nearest Fly region to Phoenix, AZ (ph
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"    # sleep when idle (user request 2026-11-25) —
-                                 # the PAPER/sim agent pauses while asleep;
-                                 # live money is NOT on Fly, it lives in the sandbox
-  auto_start_machines = true     # wakes on the next HTTP request
-  min_machines_running = 0
+  auto_stop_machines = "stop"    # console no longer sleeps: the permanent live agent
+                                 # runs on this machine (see fly-entrypoint.sh). min=1 keeps
+                                 # BOTH processes alive 24/7; Fly restarts the machine on crash.
+  auto_start_machines = true
+  min_machines_running = 1       # was 0 — always-on for the permanent live agent (user request 2026-11-26)
 
 [[http_service.checks]]
   interval = "30s"
