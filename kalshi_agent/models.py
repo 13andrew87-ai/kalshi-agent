@@ -72,6 +72,10 @@ class Market:
         status = (d.get("status") or "open").lower()
         if status == "active":
             status = "open"
+        elif status in ("determined", "finalized"):
+            # Kalshi's real terminal statuses — settle_markets keys off these.
+            # "determined" = result in, payout pending; "finalized" = settled & paid.
+            status = "settled"
         settlement_value = None
         if d.get("settlement_value") is not None:
             settlement_value = int(d["settlement_value"])
