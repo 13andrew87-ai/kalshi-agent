@@ -186,3 +186,33 @@ care about. Same image, one reboot, no duplicates.
   that finalized is settled on the next agent cycle from `get_market` — no open
   position on the exchange means the mirror must not hold it either.
   Lost basis is written off via Portfolio.settle with `why="settlement"`.
+
+## CRITICAL — the machine idle-stops after ~300s of no EXTERNAL traffic
+
+Root-caused 2026-11-26 by experiment: the machine is STOPPED by Fly exactly
+300 seconds after every start unless EXTERNAL HTTP traffic arrives (Fly's own
+30s /healthz checks do NOT count). `auto_stop_machines = "off"` in fly.toml and
+min_machines_running=1 do NOT prevent it — Fly honors `requested_stop` regardless
+of the machine restart policy (tested with restart=always: still stops). Starts
+happen on ANY external HTTP hit (auto_start). Internal boots therefore cascade:
+boot → 300s → stop → down until the next visitor/ping.
+
+**Consequence: 24/7 autonomy requires an EXTERNAL ping every < 5 minutes.**
+
+Fix options:
+- **cron-job.org** (recommended, free): sign up, add a job →
+  URL https://kalshi-agent-andrew.fly.dev/healthz — every **1 minute** (or 4).
+- **UptimeRobot** free tier (5-min interval) is borderline vs the 300s idle — prefer cron-job.org.
+- The GitHub Actions hourly ping (`.github/workflows/uptime.yml`) remains as a
+  backstop only — insufficient alone.
+
+Evidence chain: boots at 14:17:07 → stop 14:22:08 (300.0s); boot 14:29:14 →
+stop 14:34:15; boot 14:46:29 → stop 14:51:31 — all requested_stop=true, exit 0.
+With external pings every 45s the machine ran past 7 minutes continuously
+(healthz 200 throughout, checks 1/1). Fly support ticket re: auto_stop=off
+seemingly being overridden is a reasonable escalation.
+
+Also note: `flyctl deploy` resets the machine restart policy to `on-failure`
+(it is not expressible in fly.toml) — after ANY deploy, re-apply:
+  flyctl machine update <machine-id> --restart always --yes
+Deploys also leave the machine stopped; the next external hit auto-starts it.
