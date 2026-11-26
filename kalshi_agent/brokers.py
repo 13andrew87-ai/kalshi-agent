@@ -149,25 +149,16 @@ class LiveBroker:
                         intent.action, intent.side, intent.count, intent.ticker,
                         intent.price_cents, intent.rationale)
             return []
-        tif_map = {"ioc": "immediate_or_cancel", "gtc": "good_till_canceled",
-                   "fok": "fill_or_kill"}
-        body: dict[str, Any] = {
-            "ticker": intent.ticker,
-            "type": "limit",
-            "action": intent.action,
-            "side": intent.side,
-            "count": intent.count,
-            "time_in_force": tif_map.get(self.cfg.order_type, "immediate_or_cancel"),
-            "client_order_id": intent.client_order_id(),
-        }
-        if intent.side == "yes":
-            body["yes_price"] = intent.price_cents
-        else:
-            body["no_price"] = intent.price_cents
-        log.warning("LIVE ORDER: %s", body)
+        from .order_v2 import build_v2_order_body, parse_v2_response
+        body = build_v2_order_body(ticker=intent.ticker, action=intent.action,
+                                   side=intent.side, count=intent.count,
+                                   price_cents=intent.price_cents,
+                                   order_type=self.cfg.order_type,
+                                   client_order_id=intent.client_order_id())
+        log.warning("LIVE ORDER (v2): %s", body)
         resp = self.client.create_order(body)
-        order = resp.get("order", {})
-        filled = int(order.get("taker_fill_count") or order.get("filled_count") or 0)
+        order_id, filled, remaining = parse_v2_response(resp)
+        order = {"order_id": order_id, "status": "accepted" if remaining >= 0 else "unknown"}
         fills: list[Fill] = []
         if filled > 0:
             # fetch authoritative fills from the exchange

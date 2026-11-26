@@ -145,10 +145,23 @@ def test_signed_request_includes_headers(keys):
 
 
 def test_create_order_body():
-    s = StubSession([StubResponse(200, {"order": {"order_id": "o1", "status": "executed"}})])
+    # V2: POST /portfolio/events/orders, single-book bid/ask, fixed-point string price
+    s = StubSession([StubResponse(201, {"order_id": "o1", "fill_count": "5.00",
+                                        "remaining_count": "0.00", "ts_ms": 1})])
     c = make_client(s)
-    out = c.create_order({"ticker": "T-1", "action": "buy", "side": "yes",
-                          "type": "limit", "count": 5, "yes_price": 45})
-    assert out["order"]["order_id"] == "o1"
+    from kalshi_agent.order_v2 import build_v2_order_body, parse_v2_response
+    body = build_v2_order_body(ticker="T-1", action="buy", side="yes", count=5,
+                               price_cents=45, order_type="ioc", client_order_id="cid-1")
+    out = c.create_order(body)
+    assert out["order_id"] == "o1"
     assert s.calls[0]["method"] == "POST"
-    assert s.calls[0]["json"]["yes_price"] == 45
+    assert s.calls[0]["url"].endswith("/portfolio/events/orders")
+    assert s.calls[0]["json"]["side"] == "bid"
+    assert s.calls[0]["json"]["price"] == "0.4500"
+    assert s.calls[0]["json"]["count"] == "5.00"
+    oid, filled, remaining = parse_v2_response(out)
+    assert (oid, filled, remaining) == ("o1", 5, 0)
+    # buying NO at 25c == selling YES at 75c (ask leg)
+    no_body = build_v2_order_body(ticker="T-1", action="buy", side="no", count=2,
+                                  price_cents=25, order_type="ioc", client_order_id="cid-2")
+    assert (no_body["side"], no_body["price"]) == ("ask", "0.7500")

@@ -195,10 +195,13 @@ class KalshiClient:
         return self.request("GET", "/portfolio/orders", params=params).get("orders", [])
 
     def create_order(self, body: dict[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/portfolio/orders", json_body=body)
+        # V2: legacy POST /portfolio/orders returns 410 Gone (deprecated_v1_order_endpoint)
+        return self.request("POST", "/portfolio/events/orders", json_body=body)
 
-    def cancel_order(self, order_id: str) -> dict[str, Any]:
-        return self.request("DELETE", f"/portfolio/orders/{order_id}/cancel")
+    def cancel_order(self, order_id: str, market_ticker: str | None = None) -> dict[str, Any]:
+        # V2 cancel: auto-routing needs market_ticker; fall back to explicit shard 0
+        params = {"market_ticker": market_ticker} if market_ticker else {"exchange_index": 0}
+        return self.request("DELETE", f"/portfolio/events/orders/{order_id}", params=params)
 
     def cancel_all_orders(self) -> int:
         canceled = 0

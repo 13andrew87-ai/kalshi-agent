@@ -1,6 +1,7 @@
 """Account mode (real-money console) + chat YES/NO confirm flow."""
 
 import re
+import pytest
 import tempfile
 import threading
 import http.cookiejar
@@ -36,10 +37,11 @@ class FakeClient:
 
     def create_order(self, body):
         self.orders.append(body)
-        self.balance += (body["count"] * (body.get("yes_price") or body.get("no_price"))
-                         if body["action"] == "sell"
-                         else -body["count"] * (body.get("yes_price") or body.get("no_price")) - 1)
-        return {"order": {"order_id": "ord-acct-1", "taker_fill_count": body["count"]}}
+        leg_cents = float(body["price"]) * 100   # v2: YES-leg price in fixed-point dollars
+        cnt = float(body["count"])
+        is_credit = (body["side"] == "ask")      # ask = selling YES == taking money in
+        self.balance += int(cnt * leg_cents) if is_credit else -int(cnt * leg_cents) - 1
+        return {"order_id": "ord-acct-1", "fill_count": str(body["count"]), "remaining_count": "0.00", "ts_ms": 1}
 
 
 def make_dash(tmp_dir):
@@ -110,8 +112,8 @@ def test_chat_yes_flow_places_order():
         req = urllib.request.Request(f"http://127.0.0.1:{port}{base}/bet/chat",
                                      data=b"prompt=yes")
         body = opener.open(req, timeout=5).read().decode()
-        assert fake.orders and fake.orders[0]["action"] == "buy"
-        assert fake.orders[0]["yes_price"] == 25
+        assert fake.orders and fake.orders[0]["side"] == "bid"
+        assert float(fake.orders[0]["price"]) == pytest.approx(0.25)
         assert dash._chat_pending is None
         assert "TOTAL FUNDS now" in body
         httpd.shutdown()

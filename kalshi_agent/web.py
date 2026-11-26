@@ -553,41 +553,28 @@ class WebDashboard:
                         action=fresh.get("action", "buy"),
                         count=fresh["count"], price_cents=fresh["price_cents"],
                         rationale=fresh.get("rationale", "") or "manual prompt-box bet")
-        tif_map = {"ioc": "immediate_or_cancel", "gtc": "good_till_canceled",
-                   "fok": "fill_or_kill"}
-        body: dict = {
-            "ticker": intent.ticker,
-            "type": "limit",
-            "action": intent.action,
-            "side": intent.side,
-            "count": intent.count,
-            "time_in_force": tif_map.get(cfg.order_type, "immediate_or_cancel"),
-            "client_order_id": intent.client_order_id(),
-        }
-        if intent.side == "yes":
-            body["yes_price"] = intent.price_cents
-        else:
-            body["no_price"] = intent.price_cents
+        from .order_v2 import build_v2_order_body, parse_v2_response
+        body = build_v2_order_body(ticker=intent.ticker, action=intent.action,
+                                   side=intent.side, count=intent.count,
+                                   price_cents=intent.price_cents,
+                                   order_type=cfg.order_type,
+                                   client_order_id=intent.client_order_id())
         env = self.credentials.get("env") or "live"
-        log.warning("MANUAL BET %s (%s): %s", fresh.get("action", "buy").upper(), env.upper(), body)
+        log.warning("MANUAL BET (v2) %s (%s): %s", fresh.get("action", "buy").upper(), env.upper(), body)
         client = self._signed_client()
         try:
             resp = client.create_order(body)
         except Exception as exc:  # noqa: BLE001
             log.exception("manual bet rejected")
             return {"ok": False, "error": f"Kalshi rejected the order: {exc}", "bet": fresh}
-        order = resp.get("order", {}) or {}
-        try:
-            filled = int(order.get("taker_fill_count") or order.get("filled_count") or 0)
-        except (TypeError, ValueError):
-            filled = 0
+        order_id, filled, _remaining = parse_v2_response(resp)
         # refresh TOTAL FUNDS immediately after any placed bet
         funds = self.funds_snapshot(force=True)
         return {
             "ok": True,
             "bet": fresh,
             "filled": filled,
-            "order_id": str(order.get("order_id") or ""),
+            "order_id": order_id,
             "funds": funds,
             "env": env,
         }

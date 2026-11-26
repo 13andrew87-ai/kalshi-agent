@@ -169,8 +169,10 @@ class _FakeClient:
 
     def create_order(self, body):
         self.orders.append(body)
-        self.balance -= body["count"] * (body.get("yes_price") or body.get("no_price")) + 1
-        return {"order": {"order_id": "ord-test-1", "taker_fill_count": body["count"]}}
+        leg_cents = float(body["price"]) * 100
+        if body["side"] in ("bid", "ask") and leg_cents is not None:
+            self.balance -= int(float(body["count"]) * leg_cents) + 1
+        return {"order_id": "ord-test-1", "fill_count": str(body["count"]), "remaining_count": "0.00", "ts_ms": 1}
 
 
 def make_dash(tmp):
@@ -198,7 +200,7 @@ def test_stage_confirm_and_single_use(tmp_path):
     token = dash.stage_pending(staged["bet"])
     out = dash.confirm_pending(token)
     assert out["ok"], out
-    assert fake.orders and fake.orders[0]["yes_price"] == 28
+    assert fake.orders and fake.orders[0]["side"] == "bid" and float(fake.orders[0]["price"]) == pytest.approx(0.28)
     assert out["filled"] == 1
     assert out["funds"]["cents"] == fake.balance   # funds re-fetched after the bet
     assert not dash.confirm_pending(token)["ok"]   # single-use
@@ -239,7 +241,7 @@ def test_full_flow_via_http(monkeypatch):
                                  data=f"token={token}".encode())
     body = opener.open(req, timeout=5).read().decode()
     assert "Order sent to Kalshi" in body and "TOTAL FUNDS now" in body
-    assert fake.orders and fake.orders[0]["yes_price"] == 25
+    assert fake.orders and fake.orders[0]["side"] == "bid" and float(fake.orders[0]["price"]) == pytest.approx(0.25)
     # replay must be refused (single use)
     req = urllib.request.Request(f"http://127.0.0.1:{port}{_base()}/bet/confirm",
                                  data=f"token={token}".encode())
@@ -319,7 +321,7 @@ class _HeldClient(_FakeClient):
 
     def create_order(self, body):
         super().create_order(body)
-        return {"order": {"order_id": "ord-sell-1", "taker_fill_count": body["count"]}}
+        return {"order_id": "ord-sell-1", "fill_count": str(body["count"]), "remaining_count": "0.00", "ts_ms": 1}
 
 
 def test_full_sell_flow_via_http(tmp_path):
@@ -349,5 +351,6 @@ def test_full_sell_flow_via_http(tmp_path):
                                  data=f"token={m.group(1)}".encode())
     body = opener.open(req, timeout=5).read().decode()
     assert "Order sent to Kalshi" in body and "SELL 1" in body
-    assert fake.orders[0]["action"] == "sell" and fake.orders[0]["yes_price"] == 27
+    # v2 sell flow: selling YES is an "ask" leg directly on the YES book
+    assert fake.orders[0]["side"] == "ask" and float(fake.orders[0]["price"]) == pytest.approx(0.27)
     httpd.shutdown()
