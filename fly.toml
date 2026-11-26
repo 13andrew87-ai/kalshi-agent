@@ -18,9 +18,10 @@ primary_region = "lax"   # Los Angeles — nearest Fly region to Phoenix, AZ (ph
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"    # console no longer sleeps: the permanent live agent
-                                 # runs on this machine (see fly-entrypoint.sh). min=1 keeps
-                                 # BOTH processes alive 24/7; Fly restarts the machine on crash.
+  auto_stop_machines = "off"     # NEVER idle-stop: the permanent live agent runs on this
+                                 # machine (see fly-entrypoint.sh). min=1 pins it 24/7; Fly
+                                 # restarts it on crash. "stop" caused an unattended outage
+                                 # 2026-11-26 01:40-01:54 (machine stopped itself, agent down).
   auto_start_machines = true
   min_machines_running = 1       # was 0 — always-on for the permanent live agent (user request 2026-11-26)
 
