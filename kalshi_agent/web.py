@@ -1838,7 +1838,7 @@ class _Handler(BaseHTTPRequestHandler):
                              "• or plain English if Claude is configured\n"
                              "• funds — re-pull your Kalshi balance\n"
                              "• yes / no — answer a pending bet\n"
-                             "• “make four 75 cent bets on the most likely markets” — plain-English multi-bet batch, YES each\n"
+                             "• “make 8 75 cent bets on the most likely markets” — plain-English multi-bet batch (max 8), YES each\n"
                              "• maximize profits for N minutes — all-market hunt (any liquid market), time-boxed\n"
                              "• hunt / next pick — fetch my current best pick while a hunt window is live\n"
                              "• stop hunting — kill the window early\n"
@@ -1965,7 +1965,7 @@ class _Handler(BaseHTTPRequestHandler):
             f"{i + 1}. BUY {b['count']} {b['side'].upper()} {b['ticker']} @ {b['price_cents']}c"
             for i, b in enumerate(accepted))
         stake_txt = f" · per-bet stake ≤ {_fmt_usd(stake)}" if stake else ""
-        dash.chat("app", f"🎯 Batch — {len(accepted)} bet(s) it likes best{stake_txt}:\n{plan_lines}\n"
+        dash.chat("app", f"🎯 Batch — {len(accepted)} bet(s) it likes best{stake_txt} (max 8 per batch):\n{plan_lines}\n"
                         f"walking you through them one at a time (YES sends / NO passes, 10-minute window each)."
                         + ("\n" + refused_lines if refused_lines else ""))
         self._advance_batch()
