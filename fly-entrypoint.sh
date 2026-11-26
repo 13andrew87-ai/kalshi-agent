@@ -19,10 +19,19 @@ if [ -z "$KEY_ID" ]; then
   KEY_ID="${KALSHI_API_KEY_ID:-}"
 fi
 
+GROQ_ENV=""
+if [ -f /app/state/groq_api_key ]; then
+  GROQ_ENV=$(cat /app/state/groq_api_key)
+  echo "fly-entrypoint: groq key found on volume — AI exits enabled"
+else
+  echo "fly-entrypoint: WARN no /app/state/groq_api_key — AI exit calls will fail" >&2
+fi
+
 if [ -n "$KEY_ID" ] && [ -f "$CRED_DIR/kalshi_private_key.pem" ]; then
   echo "fly-entrypoint: live agent ARMED (key ${KEY_ID})"
   (
     while true; do
+      GROQ_API_KEY="$GROQ_ENV" \
       KALSHI_LIVE_CONFIRM=YES \
       KALSHI_API_KEY_ID="$KEY_ID" \
       KALSHI_PRIVATE_KEY_PATH="$CRED_DIR/kalshi_private_key.pem" \
